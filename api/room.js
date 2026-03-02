@@ -41,11 +41,12 @@ module.exports = function(req, res) {
   /* CREATE */
   if (action === 'create') {
     var name = decodeURIComponent(q.name || 'Hostitel');
+    var jr = q.junior === '1';
     var code = makeCode();
     var pid = makeId();
     var room = {
       v: 0, created: Date.now(), code: code, state: 'lobby', hostPid: pid,
-      players: [{pid:pid,name:name,color:'#e94560',score:0,streak:0,correct:0}],
+      players: [{pid:pid,name:name,color:'#e94560',score:0,streak:0,correct:0,junior:jr}],
       questions: prepQuestions(), curQ: 0, qStartTime: 0, answers: {},
       lastUpdate: Date.now()
     };
@@ -62,10 +63,10 @@ module.exports = function(req, res) {
     if (!room) { res.json({ok:false,error:'not_found'}); return; }
     if (room.state !== 'lobby') { res.json({ok:false,error:'already_started'}); return; }
     if (room.players.length >= 4) { res.json({ok:false,error:'full'}); return; }
-    // Check duplicate name
+    var jr = q.junior === '1';
     var pid = makeId();
     var colors = ['#e94560','#2979ff','#00c853','#ff6d00'];
-    room.players.push({pid:pid,name:name,color:colors[room.players.length],score:0,streak:0,correct:0});
+    room.players.push({pid:pid,name:name,color:colors[room.players.length],score:0,streak:0,correct:0,junior:jr});
     room.v++; room.lastUpdate = Date.now();
     writeRoom(code, room);
     res.json({ok:true, pid:pid, players:stripPids(room.players)});
@@ -173,6 +174,29 @@ module.exports = function(req, res) {
     return;
   }
 
+  /* HINT 50:50 — server picks 2 wrong answers to hide */
+  if (action === 'hint5050') {
+    var code = (q.code||'').toUpperCase();
+    var pid = q.pid||'';
+    var room = readRoom(code);
+    if (!room) { res.json({ok:false,error:'not_found'}); return; }
+    if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
+    // Find player
+    var pl = null;
+    for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) pl=room.players[i];
+    if (!pl || !pl.junior) { res.json({ok:false,error:'not_junior'}); return; }
+    if ((pl.hints5050used||0) >= 3) { res.json({ok:false,error:'no_hints'}); return; }
+    pl.hints5050used = (pl.hints5050used||0)+1;
+    var qd = room.questions[room.curQ];
+    var wrong = [];
+    for (var j=0;j<qd.a.length;j++) if (j!==qd.c) wrong.push(j);
+    wrong.sort(function(){return Math.random()-0.5});
+    var hide = wrong.slice(0,2);
+    writeRoom(code, room);
+    res.json({ok:true, hide:hide, remaining:3-pl.hints5050used});
+    return;
+  }
+
   /* BACKUP — host periodically saves full room */
   if (action === 'backup') {
     if (req.method !== 'POST') { res.json({ok:false}); return; }
@@ -202,7 +226,8 @@ function resolveRound(room) {
     if (ok) {
       p.streak=(p.streak||0)+1; p.correct=(p.correct||0)+1;
       var speed=Math.round((1-Math.min(ans.time/maxT,1))*50);
-      pts=Math.round((100+speed)*mult*(p.streak>=3?1.5:1));
+      var jrMult = p.junior ? 1.3 : 1;
+      pts=Math.round((100+speed)*mult*(p.streak>=3?1.5:1)*jrMult);
       p.score+=pts;
     } else { p.streak=0; }
     p.lastPts=pts; p.lastOk=ok;
@@ -214,7 +239,7 @@ function specType(i){if(i===4)return'blitz';if(i===9)return'bet';if(i===14)retur
 function getMaxTime(s){if(s==='blitz')return 7;if(s==='finale')return 20;return 15;}
 function makeCode(){var c='',ch='ABCDEFGHJKLMNPQRSTUVWXYZ';for(var i=0;i<4;i++)c+=ch[Math.floor(Math.random()*ch.length)];return c;}
 function makeId(){var c='',ch='abcdefghijklmnopqrstuvwxyz0123456789';for(var i=0;i<12;i++)c+=ch[Math.floor(Math.random()*ch.length)];return c;}
-function stripPids(p){var r=[];for(var i=0;i<p.length;i++){var x=p[i];r.push({name:x.name,color:x.color,score:x.score,streak:x.streak,correct:x.correct,lastPts:x.lastPts,lastOk:x.lastOk});}return r;}
+function stripPids(p){var r=[];for(var i=0;i<p.length;i++){var x=p[i];r.push({name:x.name,color:x.color,score:x.score,streak:x.streak,correct:x.correct,lastPts:x.lastPts,lastOk:x.lastOk,junior:!!x.junior});}return r;}
 function prepQuestions(){
   var allQ=[
 {cat:"🌍 Zeměpis",q:"Jaké je hlavní město Austrálie?",a:["Canberra","Sydney","Melbourne","Brisbane"],c:0},

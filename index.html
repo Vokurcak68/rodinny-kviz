@@ -27,10 +27,12 @@ button:active{transform:scale(.96)}
 .ba{background:#16213e;border:2px solid #333;text-align:left;padding:16px 20px;font-size:1em;max-width:100%}
 .ba.correct{background:#00c853!important;border-color:#00c853!important}
 .ba.wrong{background:#ff1744!important;border-color:#ff1744!important}
-.ba.dim{opacity:.5}
+.ba.dim{opacity:.4;pointer-events:none}
 .ba.picked{border-color:#f5c518!important;border-width:3px}
+.ba.hidden5050{display:none!important}
 .lobby-list{width:100%;display:flex;flex-direction:column;gap:8px}
 .lp{display:flex;align-items:center;gap:12px;padding:12px 16px;background:#16213e;border-radius:10px;font-size:1.1em}
+.lp .badge{font-size:.75em;padding:2px 8px;border-radius:8px;background:#7c4dff;margin-left:auto}
 .dot{border-radius:50%;flex-shrink:0}
 .timer-text{font-size:2.2em;font-weight:700;font-variant-numeric:tabular-nums}
 .tbar-wrap{width:100%;height:6px;background:#333;border-radius:3px;overflow:hidden}
@@ -67,6 +69,12 @@ button:active{transform:scale(.96)}
 .foot{color:#555;font-size:.75em;text-align:center}
 .err{color:#ff1744;font-size:.9em;text-align:center;min-height:1.2em}
 .answered-info{color:#f5c518;font-size:1em;text-align:center}
+.jr-toggle{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#16213e;border-radius:12px;cursor:pointer;-webkit-user-select:none;user-select:none}
+.jr-toggle input{width:20px;height:20px;accent-color:#7c4dff}
+.jr-toggle .jr-label{font-size:1em;color:#ccc}
+.jr-toggle .jr-desc{font-size:.8em;color:#888}
+.btn5050{background:linear-gradient(135deg,#7c4dff,#536dfe);max-width:200px;padding:10px 20px;font-size:1em;margin:0 auto}
+.btn5050:disabled{opacity:.4;cursor:default}
 </style>
 </head>
 <body>
@@ -76,9 +84,16 @@ button:active{transform:scale(.96)}
 <h1>🧠 Rodinný Kvíz</h1>
 <p class="sub">Multiplayer — každý na svém mobilu!</p>
 <input type="text" id="myname" placeholder="Tvoje jméno" maxlength="12">
+<label class="jr-toggle">
+<input type="checkbox" id="jr-check">
+<div>
+<div class="jr-label">🧒 Junior mód</div>
+<div class="jr-desc">+5s, 3× nápověda 50:50, bonus body</div>
+</div>
+</label>
 <button class="bp" onclick="doCreate()">🎮 Vytvořit hru</button>
 <button class="bg" onclick="goJoin()">🔗 Připojit se</button>
-<p class="foot">v4.0 | ⚡ Arc</p>
+<p class="foot">v4.2 | ⚡ Arc</p>
 </div>
 
 <div class="scr" id="s-join">
@@ -87,7 +102,7 @@ button:active{transform:scale(.96)}
 <input type="text" id="joincode" placeholder="ABCD" maxlength="4" style="font-size:2em;letter-spacing:8px;text-transform:uppercase">
 <button class="bp" onclick="doJoin()">Připojit se</button>
 <p class="err" id="join-err"></p>
-<button class="bg" onclick="show('s-home')" style="max-width:200px;padding:10px;font-size:.9em">⬅ Zpět</button>
+<button class="bg" onclick="show('s-home')" style="max-width:200px;padding:10px;font-size:.9em">&#x2B05; Zpět</button>
 </div>
 
 <div class="scr" id="s-lobby">
@@ -108,6 +123,7 @@ button:active{transform:scale(.96)}
 <div class="qtext" id="qtxt"></div>
 <div class="timer-text" id="ttxt">15</div>
 <div class="tbar-wrap"><div class="tbar" id="tbar"></div></div>
+<div id="hint-wrap" style="text-align:center"></div>
 <div class="answers" id="ans"></div>
 <div class="answered-info" id="ans-info"></div>
 </div>
@@ -121,7 +137,7 @@ button:active{transform:scale(.96)}
 <div class="scr" id="s-round">
 <div class="rcard" id="round-card"></div>
 <div class="sboard" id="round-score"></div>
-<button class="bp" id="btn-next" onclick="doNext()" style="display:none">▶ Další otázka</button>
+<button class="bp" id="btn-next" onclick="doNext()" style="display:none">&#x25B6; Další otázka</button>
 <p class="wait" id="round-wait" style="display:none">Čekám na hostitele...</p>
 </div>
 
@@ -140,6 +156,8 @@ var API = '/api/room';
 var myPid = '';
 var roomCode = '';
 var isHost = false;
+var isJunior = false;
+var hints5050 = 3;
 var pollTimer = null;
 var lastV = -1;
 var curScreen = 'home';
@@ -148,7 +166,6 @@ var qStartLocal = 0;
 var maxTime = 15;
 var myAnswered = false;
 var timerIv = null;
-
 /* Audio */
 var actx=null;
 function initA(){try{var C=window.AudioContext||window.webkitAudioContext;if(!actx&&C)actx=new C();if(actx&&actx.state==='suspended')actx.resume()}catch(e){}}
@@ -167,6 +184,7 @@ function show(id){
   curScreen=id;
 }
 function getName(){var n=G('myname').value.trim();if(!n)n='Hráč '+Math.floor(Math.random()*99+1);return n;}
+function getJunior(){return G('jr-check').checked?1:0;}
 
 function apiGet(action, params, cb) {
   var url=API+'?action='+action;
@@ -185,7 +203,9 @@ function apiGet(action, params, cb) {
 function doCreate(){
   initA();
   var name=getName();
-  apiGet('create',{name:name},function(err,d){
+  isJunior=!!getJunior();
+  hints5050=isJunior?3:0;
+  apiGet('create',{name:name,junior:getJunior()},function(err,d){
     if(err||!d||!d.ok){alert('Chyba při vytváření.');return;}
     myPid=d.pid; roomCode=d.code; isHost=true; lastV=-1;
     G('lobby-code').textContent=roomCode;
@@ -204,7 +224,9 @@ function doJoin(){
   if(code.length!==4){G('join-err').textContent='Zadej 4-písmenný kód!';return;}
   G('join-err').textContent='⏳ Připojuji se...';
   var name=getName();
-  apiGet('join',{code:code,name:name},function(err,d){
+  isJunior=!!getJunior();
+  hints5050=isJunior?3:0;
+  apiGet('join',{code:code,name:name,junior:getJunior()},function(err,d){
     if(err||!d){G('join-err').textContent='❌ Chyba sítě.';return;}
     if(!d.ok){
       var msgs={not_found:'❌ Místnost "'+code+'" neexistuje.',full:'❌ Plná.',already_started:'❌ Hra už běží.'};
@@ -236,21 +258,44 @@ function doNext(){
   apiGet('next',{code:roomCode,pid:myPid},function(){});
 }
 
-/* POLLING — all state comes from server */
+/* 50:50 — server picks which answers to hide */
+function use5050(){
+  if(hints5050<=0||myAnswered) return;
+  apiGet('hint5050',{code:roomCode,pid:myPid},function(err,d){
+    if(err||!d||!d.ok) return;
+    hints5050=d.remaining;
+    beep(600,.08);
+    setTimeout(function(){beep(800,.08)},80);
+    var btns=G('ans').querySelectorAll('.ba');
+    for(var j=0;j<d.hide.length;j++){
+      if(d.hide[j]>=0 && d.hide[j]<btns.length) btns[d.hide[j]].classList.add('hidden5050');
+    }
+    render5050btn();
+  });
+}
+
+function render5050btn(){
+  var wrap=G('hint-wrap');
+  if(!isJunior||myAnswered){wrap.innerHTML='';return;}
+  if(hints5050>0){
+    wrap.innerHTML='<button class="btn5050" onclick="use5050()">50:50 ('+hints5050+'x)</button>';
+  } else {
+    wrap.innerHTML='<button class="btn5050" disabled>50:50 (0x)</button>';
+  }
+}
+
+/* POLLING */
 function startPoll(){
   if(pollTimer)clearInterval(pollTimer);
-  doPoll(); // immediate first poll
+  doPoll();
   pollTimer=setInterval(doPoll,1500);
 }
 
 function doPoll(){
   apiGet('poll',{code:roomCode,pid:myPid},function(err,d){
     if(err||!d||!d.ok) return;
-
-    // Only process if version changed (or first poll)
     if(d.v===lastV && curScreen!=='s-lobby') return;
     lastV=d.v;
-
     var players=d.players||[];
 
     /* LOBBY */
@@ -269,12 +314,10 @@ function doPoll(){
     /* PLAYING */
     if(d.state==='playing'){
       if(shownQ!==d.curQ){
-        // New question
         shownQ=d.curQ;
         myAnswered=false;
         showQuestion(d);
       } else if(myAnswered){
-        // Update answer count
         if(d.answeredCount) G('wait-info').textContent='Odpovědělo '+d.answeredCount+'/'+d.totalPlayers;
       }
     }
@@ -299,14 +342,21 @@ function renderLobby(pls){
   var h='';
   for(var i=0;i<pls.length;i++){
     var p=pls[i];
-    h+='<div class="lp"><div class="dot" style="width:20px;height:20px;background:'+p.color+'"></div><span>'+p.name+'</span></div>';
+    var badge=p.junior?'<span class="badge">🧒 Junior</span>':'';
+    h+='<div class="lp"><div class="dot" style="width:20px;height:20px;background:'+p.color+'"></div><span>'+p.name+'</span>'+badge+'</div>';
   }
   G('lobby-list').innerHTML=h;
 }
 
 /* QUESTION */
 function specType(i){if(i===4)return'blitz';if(i===9)return'bet';if(i===14)return'finale';return'';}
-function getMaxTime(s){if(s==='blitz')return 7;if(s==='finale')return 20;return 15;}
+function getMaxTime(s){
+  var base=15;
+  if(s==='blitz') base=7;
+  if(s==='finale') base=20;
+  if(isJunior) base+=5;
+  return base;
+}
 
 function showQuestion(d){
   clearInterval(timerIv);
@@ -330,17 +380,19 @@ function showQuestion(d){
     aH+='<button class="ba" id="a'+i+'" onclick="pickAnswer('+i+')">'+labels[i]+'. '+q.a[i]+'</button>';
   }
   G('ans').innerHTML=aH;
+  render5050btn();
 
-  // If already answered (reconnect scenario)
   if(d.myAnswered){
     myAnswered=true;
     var btns=G('ans').querySelectorAll('.ba');
     for(var j=0;j<btns.length;j++){btns[j].onclick=null;btns[j].classList.add('dim');}
     G('ans-info').textContent='✅ Už jsi odpověděl/a';
+    G('hint-wrap').innerHTML='';
     return;
   }
 
   var serverElapsed=(d.serverTime-d.qStartTime)/1000;
+  /* Junior gets extra time on server too, but locally we just calculate based on our maxTime */
   qStartLocal=Date.now()-(serverElapsed*1000);
   updateTimer();
   timerIv=setInterval(updateTimer,200);
@@ -368,13 +420,14 @@ function pickAnswer(idx){
   myAnswered=true;
   initA();
   clearInterval(timerIv);
+  G('hint-wrap').innerHTML='';
   var elapsed=(Date.now()-qStartLocal)/1000;
 
   var btns=G('ans').querySelectorAll('.ba');
   for(var i=0;i<btns.length;i++){
     btns[i].onclick=null;
     if(i===idx) btns[i].classList.add('picked');
-    else btns[i].classList.add('dim');
+    else if(!btns[i].classList.contains('hidden5050')) btns[i].classList.add('dim');
   }
 
   apiGet('answer',{code:roomCode,pid:myPid,idx:idx,time:elapsed.toFixed(1)},function(){});
@@ -390,6 +443,7 @@ function pickAnswer(idx){
 /* ROUND RESULT */
 function showRoundResult(d){
   clearInterval(timerIv);
+  G('hint-wrap').innerHTML='';
   var me=d.myIdx>=0?d.players[d.myIdx]:null;
   var ok=me&&me.lastOk;
   try{if(ok)sndOk();else sndBad()}catch(e){}
@@ -397,7 +451,8 @@ function showRoundResult(d){
   var icon=ok?'✅':'❌';
   var m=ok?'Správně!':'Špatně!';
   var pts=me&&me.lastPts>0?('+'+me.lastPts+' bodů'):'0 bodů';
-  G('round-card').innerHTML='<div class="ricon">'+icon+'</div><div style="font-size:1.3em;font-weight:700">'+m+'</div><div class="rpts">'+pts+'</div><div class="rdet">Správně: '+d.correctText+'</div>';
+  var jrNote=me&&me.junior&&me.lastPts>0?' (🧒 junior bonus)':'';
+  G('round-card').innerHTML='<div class="ricon">'+icon+'</div><div style="font-size:1.3em;font-weight:700">'+m+'</div><div class="rpts">'+pts+jrNote+'</div><div class="rdet">Správně: '+d.correctText+'</div>';
   if(ok) G('round-card').classList.add('pulse');
   else G('round-card').classList.remove('pulse');
 
@@ -419,7 +474,8 @@ function renderScoreboard(elId,sorted){
   for(var i=0;i<sorted.length;i++){
     var p=sorted[i];
     var st=p.streak>=3?(' 🔥'+p.streak):'';
-    h+='<div class="srow"><div class="sleft"><div class="dot" style="width:14px;height:14px;background:'+p.color+'"></div><span class="sname">'+medals[i]+' '+p.name+'</span><span class="sstreak">'+st+'</span></div><span class="spts">'+p.score+'</span></div>';
+    var jrTag=p.junior?' 🧒':'';
+    h+='<div class="srow"><div class="sleft"><div class="dot" style="width:14px;height:14px;background:'+p.color+'"></div><span class="sname">'+medals[i]+' '+p.name+jrTag+'</span><span class="sstreak">'+st+'</span></div><span class="spts">'+p.score+'</span></div>';
   }
   G(elId).innerHTML=h;
 }
@@ -438,7 +494,8 @@ function showFinal(pls){
     var rank=order[oi];
     if(rank<sorted.length){
       var p=sorted[rank];
-      ph+='<div class="pp p'+(rank+1)+'"><div class="medal">'+medals[rank]+'</div><div class="pn" style="color:'+p.color+'">'+p.name+'</div><div class="ps">'+p.score+'b</div><div class="pbar"></div></div>';
+      var jrTag=p.junior?' 🧒':'';
+      ph+='<div class="pp p'+(rank+1)+'"><div class="medal">'+medals[rank]+'</div><div class="pn" style="color:'+p.color+'">'+p.name+jrTag+'</div><div class="ps">'+p.score+'b</div><div class="pbar"></div></div>';
     }
   }
   G('podium').innerHTML=ph;

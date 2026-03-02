@@ -278,7 +278,22 @@ var peerReady = false;
 function makePeer(id, cb) {
   peerReady = false;
   try {
-    peer = new Peer(id, {debug: 1, config: {iceServers: [{urls:'stun:stun.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'}]}});
+    peer = new Peer(id, {
+      host: '0.peerjs.com',
+      port: 443,
+      path: '/',
+      secure: true,
+      debug: 0,
+      config: {
+        iceServers: [
+          {urls: 'stun:stun.l.google.com:19302'},
+          {urls: 'stun:global.stun.twilio.com:3478'},
+          {urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject'},
+          {urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject'},
+          {urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject'}
+        ]
+      }
+    });
   } catch(e) {
     cb(e);
     return;
@@ -454,48 +469,75 @@ function doJoin() {
       return;
     }
     var hostId = 'rkviz-' + code;
-    try {
-      hostConn = peer.connect(hostId, {reliable: true, serialization: 'json'});
-    } catch(e) {
-      G('join-err').textContent = '❌ Nelze se připojit.';
-      return;
-    }
+    var retries = 0;
+    var maxRetries = 2;
+    var connected = false;
 
-    if (!hostConn) {
-      G('join-err').textContent = '❌ Nelze se připojit.';
-      return;
-    }
-
-    var timeout = setTimeout(function() {
-      G('join-err').textContent = '❌ Místnost nenalezena. Zkontroluj kód.';
-    }, 10000);
-
-    hostConn.on('open', function() {
-      clearTimeout(timeout);
-      G('join-err').textContent = '✅ Připojeno!';
-      hostConn.send({t:'join', name: myName});
-    });
-
-    hostConn.on('data', function(raw) {
-      var msg = parseMsg(raw);
-      if (!msg) return;
-      guestHandleMsg(msg);
-    });
-
-    hostConn.on('close', function() {
-      alert('Spojení s hostitelem ztraceno!');
-      location.reload();
-    });
-
-    hostConn.on('error', function(e) {
-      clearTimeout(timeout);
-      var errType = e && e.type ? e.type : '';
-      if (errType === 'peer-unavailable') {
-        G('join-err').textContent = '❌ Místnost "' + code + '" neexistuje.';
-      } else {
-        G('join-err').textContent = '❌ Chyba připojení (' + errType + ')';
+    function tryConnect() {
+      G('join-err').textContent = '⏳ Hledám místnost' + (retries > 0 ? ' (pokus ' + (retries + 1) + ')' : '') + '...';
+      var conn;
+      try {
+        conn = peer.connect(hostId, {reliable: true});
+      } catch(e) {
+        G('join-err').textContent = '❌ Nelze se připojit.';
+        return;
       }
-    });
+      if (!conn) {
+        G('join-err').textContent = '❌ Nelze se připojit.';
+        return;
+      }
+
+      var timeout = setTimeout(function() {
+        if (connected) return;
+        try { conn.close(); } catch(e) {}
+        if (retries < maxRetries) {
+          retries++;
+          tryConnect();
+        } else {
+          G('join-err').textContent = '❌ Místnost "' + code + '" nenalezena. Zkontroluj kód.';
+        }
+      }, 8000);
+
+      conn.on('open', function() {
+        if (connected) return;
+        connected = true;
+        clearTimeout(timeout);
+        hostConn = conn;
+        G('join-err').textContent = '✅ Připojeno!';
+        conn.send({t:'join', name: myName});
+      });
+
+      conn.on('data', function(raw) {
+        var msg = parseMsg(raw);
+        if (!msg) return;
+        guestHandleMsg(msg);
+      });
+
+      conn.on('close', function() {
+        if (connected) {
+          alert('Spojení s hostitelem ztraceno!');
+          location.reload();
+        }
+      });
+
+      conn.on('error', function(e) {
+        clearTimeout(timeout);
+        var errType = e && e.type ? e.type : '';
+        if (errType === 'peer-unavailable') {
+          if (retries < maxRetries) {
+            retries++;
+            setTimeout(tryConnect, 1000);
+          } else {
+            G('join-err').textContent = '❌ Místnost "' + code + '" neexistuje.';
+          }
+        } else {
+          G('join-err').textContent = '❌ Chyba: ' + errType;
+        }
+      });
+    }
+
+    // Small delay to ensure peer is fully registered before connecting
+    setTimeout(tryConnect, 500);
   });
 }
 

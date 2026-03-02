@@ -274,14 +274,31 @@ function sortPlayers() {
 }
 
 /* ===== PEER SETUP ===== */
+var peerReady = false;
 function makePeer(id, cb) {
-  peer = new Peer(id, {debug: 0});
+  peerReady = false;
+  try {
+    peer = new Peer(id, {debug: 1, config: {iceServers: [{urls:'stun:stun.l.google.com:19302'},{urls:'stun:global.stun.twilio.com:3478'}]}});
+  } catch(e) {
+    cb(e);
+    return;
+  }
   peer.on('open', function(myPeerId) {
     myId = myPeerId;
+    peerReady = true;
     cb(null);
   });
   peer.on('error', function(err) {
-    cb(err);
+    var msg = err && err.type ? err.type : String(err);
+    if (!peerReady) {
+      cb(err);
+    }
+    if (msg === 'unavailable-id') {
+      alert('Kód místnosti je obsazený. Zkus to znovu.');
+    }
+  });
+  peer.on('disconnected', function() {
+    try { peer.reconnect(); } catch(e) {}
   });
 }
 
@@ -293,10 +310,21 @@ function doCreate() {
   isHost = true;
   var peerId = 'rkviz-' + roomCode;
 
-  G('join-err').textContent = '';
+  // Show loading state
+  var btn = document.querySelector('#s-home .bp');
+  if (btn) { btn.textContent = '⏳ Vytvářím místnost...'; btn.disabled = true; }
+
   makePeer(peerId, function(err) {
+    if (btn) { btn.textContent = '🎮 Vytvořit hru'; btn.disabled = false; }
     if (err) {
-      alert('Nepodařilo se vytvořit místnost. Zkus to znovu.');
+      var errType = err && err.type ? err.type : '';
+      if (errType === 'unavailable-id') {
+        // Try again with new code
+        roomCode = makeCode();
+        doCreate();
+        return;
+      }
+      alert('Nepodařilo se vytvořit místnost (' + errType + '). Zkus to znovu.');
       return;
     }
     players = [{id: myId, name: myName, color: COLORS[0], score: 0, streak: 0, correct: 0}];
@@ -309,9 +337,10 @@ function doCreate() {
         conn.on('data', function(data) {
           hostHandleMsg(conn, data);
         });
+        // Immediately send lobby state to new connection
+        try { conn.send({t:'lobby', players: stripPlayers(), you: conn.peer}); } catch(e) {}
       });
       conn.on('close', function() {
-        // Remove player on disconnect
         for (var i = conns.length - 1; i >= 0; i--) {
           if (conns[i] === conn) conns.splice(i, 1);
         }
@@ -337,24 +366,29 @@ function stripPlayers() {
 function broadcast(msg) {
   var s = JSON.stringify(msg);
   for (var i = 0; i < conns.length; i++) {
-    try { conns[i].send(s); } catch(e) {}
+    try { conns[i].send(msg); } catch(e) {}
   }
 }
 
+function parseMsg(raw) {
+  if (typeof raw === 'object' && raw !== null) return raw;
+  try { return JSON.parse(raw); } catch(e) { return null; }
+}
+
 function hostHandleMsg(conn, raw) {
-  var msg;
-  try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { return; }
+  var msg = parseMsg(raw);
+  if (!msg) return;
 
   if (msg.t === 'join') {
     if (players.length >= 4) {
-      try { conn.send(JSON.stringify({t:'full'})); } catch(e) {}
+      try { conn.send({t:'full'}); } catch(e) {}
       return;
     }
     var p = {id: conn.peer, name: msg.name, color: COLORS[players.length], score: 0, streak: 0, correct: 0};
     players.push(p);
     renderLobby();
     broadcast({t:'lobby', players: stripPlayers()});
-    try { conn.send(JSON.stringify({t:'lobby', players: stripPlayers(), you: conn.peer})); } catch(e) {}
+    try { conn.send({t:'lobby', players: stripPlayers(), you: conn.peer}); } catch(e) {}
   }
 
   if (msg.t === 'answer') {
@@ -411,29 +445,40 @@ function doJoin() {
   }
   roomCode = code;
   isHost = false;
-  G('join-err').textContent = 'Připojuji se...';
+  G('join-err').textContent = '⏳ Připojuji se...';
 
   var peerId = 'rkviz-p-' + Math.random().toString(36).substring(2, 8);
   makePeer(peerId, function(err) {
     if (err) {
-      G('join-err').textContent = 'Chyba připojení. Zkus znovu.';
+      G('join-err').textContent = '❌ Chyba sítě. Zkus znovu.';
       return;
     }
     var hostId = 'rkviz-' + code;
-    hostConn = peer.connect(hostId, {reliable: true});
+    try {
+      hostConn = peer.connect(hostId, {reliable: true, serialization: 'json'});
+    } catch(e) {
+      G('join-err').textContent = '❌ Nelze se připojit.';
+      return;
+    }
+
+    if (!hostConn) {
+      G('join-err').textContent = '❌ Nelze se připojit.';
+      return;
+    }
 
     var timeout = setTimeout(function() {
-      G('join-err').textContent = 'Místnost nenalezena. Zkontroluj kód.';
-    }, 8000);
+      G('join-err').textContent = '❌ Místnost nenalezena. Zkontroluj kód.';
+    }, 10000);
 
     hostConn.on('open', function() {
       clearTimeout(timeout);
-      hostConn.send(JSON.stringify({t:'join', name: myName}));
+      G('join-err').textContent = '✅ Připojeno!';
+      hostConn.send({t:'join', name: myName});
     });
 
     hostConn.on('data', function(raw) {
-      var msg;
-      try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch(e) { return; }
+      var msg = parseMsg(raw);
+      if (!msg) return;
       guestHandleMsg(msg);
     });
 
@@ -442,9 +487,14 @@ function doJoin() {
       location.reload();
     });
 
-    hostConn.on('error', function() {
+    hostConn.on('error', function(e) {
       clearTimeout(timeout);
-      G('join-err').textContent = 'Místnost nenalezena. Zkontroluj kód.';
+      var errType = e && e.type ? e.type : '';
+      if (errType === 'peer-unavailable') {
+        G('join-err').textContent = '❌ Místnost "' + code + '" neexistuje.';
+      } else {
+        G('join-err').textContent = '❌ Chyba připojení (' + errType + ')';
+      }
     });
   });
 }
@@ -493,7 +543,7 @@ function guestHandleMsg(msg) {
 
 function guestSend(msg) {
   if (hostConn) {
-    try { hostConn.send(JSON.stringify(msg)); } catch(e) {}
+    try { hostConn.send(msg); } catch(e) {}
   }
 }
 

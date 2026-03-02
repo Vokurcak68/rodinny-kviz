@@ -1,5 +1,9 @@
 {
-  "rewrites": [
-    {"source": "/api/room", "destination": "/api/room"}
-  ]
+  "regions": ["fra1"],
+  "functions": {
+    "api/room.js": {
+      "memory": 128,
+      "maxDuration": 10
+    }
+  }
 }

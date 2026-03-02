@@ -78,7 +78,7 @@ button:active{transform:scale(.96)}
 <input type="text" id="myname" placeholder="Tvoje jméno" maxlength="12">
 <button class="bp" onclick="doCreate()">🎮 Vytvořit hru</button>
 <button class="bg" onclick="goJoin()">🔗 Připojit se</button>
-<p class="foot">Vytvořeno s ⚡ od Arca | v3.2</p>
+<p class="foot">v4.0 | ⚡ Arc</p>
 </div>
 
 <div class="scr" id="s-join">
@@ -121,7 +121,8 @@ button:active{transform:scale(.96)}
 <div class="scr" id="s-round">
 <div class="rcard" id="round-card"></div>
 <div class="sboard" id="round-score"></div>
-<p class="wait">Další otázka za chvíli...</p>
+<button class="bp" id="btn-next" onclick="doNext()" style="display:none">▶ Další otázka</button>
+<p class="wait" id="round-wait" style="display:none">Čekám na hostitele...</p>
 </div>
 
 <div class="scr" id="s-final">
@@ -139,18 +140,17 @@ var API = '/api/room';
 var myPid = '';
 var roomCode = '';
 var isHost = false;
-var players = [];
 var pollTimer = null;
-var curState = '';
-var curQ = -1;
+var lastV = -1;
+var curScreen = 'home';
+var shownQ = -1;
 var qStartLocal = 0;
 var maxTime = 15;
 var myAnswered = false;
-var timerInterval = null;
-var hostRoom = null; /* host keeps full room state locally */
+var timerIv = null;
 
-/* audio */
-var actx = null;
+/* Audio */
+var actx=null;
 function initA(){try{var C=window.AudioContext||window.webkitAudioContext;if(!actx&&C)actx=new C();if(actx&&actx.state==='suspended')actx.resume()}catch(e){}}
 function beep(f,d,t,v){try{if(!actx)return;var o=actx.createOscillator(),g=actx.createGain();o.connect(g);g.connect(actx.destination);o.type=t||'sine';o.frequency.value=f;g.gain.value=v||.12;o.start();g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+d);o.stop(actx.currentTime+d)}catch(e){}}
 function sndOk(){beep(523,.1);setTimeout(function(){beep(659,.1)},100);setTimeout(function(){beep(784,.15)},200)}
@@ -158,437 +158,305 @@ function sndBad(){beep(200,.3,'sawtooth',.1)}
 function sndTick(){beep(800,.05,'sine',.08)}
 function sndEnd(){beep(523,.15);setTimeout(function(){beep(659,.15)},150);setTimeout(function(){beep(784,.15)},300);setTimeout(function(){beep(1047,.3)},450)}
 
-/* helpers */
+/* Helpers */
 function G(id){return document.getElementById(id)}
 function show(id){
   var all=document.querySelectorAll('.scr');
   for(var i=0;i<all.length;i++) all[i].classList.remove('on');
   G(id).classList.add('on');
+  curScreen=id;
 }
-function getName(){
-  var n=G('myname').value.trim();
-  if(!n) n='Hráč '+Math.floor(Math.random()*99+1);
-  return n;
-}
+function getName(){var n=G('myname').value.trim();if(!n)n='Hráč '+Math.floor(Math.random()*99+1);return n;}
 
-function api(action, params, cb, postBody) {
-  var url = API + '?action=' + action;
-  var keys = Object.keys(params || {});
-  for (var i = 0; i < keys.length; i++) {
-    url += '&' + keys[i] + '=' + encodeURIComponent(params[keys[i]]);
-  }
-  var xhr = new XMLHttpRequest();
-  xhr.open(postBody ? 'POST' : 'GET', url, true);
-  if (postBody) xhr.setRequestHeader('Content-Type', 'application/json');
-  xhr.onload = function() {
-    try { var d = JSON.parse(xhr.responseText); cb(null, d); } catch(e) { cb(e); }
-  };
-  xhr.onerror = function() { cb(new Error('network')); };
-  xhr.timeout = 8000;
-  xhr.ontimeout = function() { cb(new Error('timeout')); };
-  xhr.send(postBody ? JSON.stringify(postBody) : null);
+function apiGet(action, params, cb) {
+  var url=API+'?action='+action;
+  var keys=Object.keys(params||{});
+  for(var i=0;i<keys.length;i++) url+='&'+keys[i]+'='+encodeURIComponent(params[keys[i]]);
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET',url,true);
+  xhr.onload=function(){try{cb(null,JSON.parse(xhr.responseText))}catch(e){cb(e)}};
+  xhr.onerror=function(){cb(new Error('network'))};
+  xhr.timeout=8000;
+  xhr.ontimeout=function(){cb(new Error('timeout'))};
+  xhr.send();
 }
 
 /* CREATE */
-function doCreate() {
+function doCreate(){
   initA();
-  var name = getName();
-  api('create', {name: name}, function(err, d) {
-    if (err || !d || !d.ok) {
-      alert('Nepodařilo se vytvořit místnost.');
-      return;
-    }
-    myPid = d.pid;
-    roomCode = d.code;
-    isHost = true;
-    hostRoom = d.room; /* store full room state */
-    G('lobby-code').textContent = roomCode;
-    renderLobby([{name: name, color: '#e94560', score: 0}]);
-    G('btn-start').style.display = 'none';
-    G('lobby-wait').style.display = 'none';
+  var name=getName();
+  apiGet('create',{name:name},function(err,d){
+    if(err||!d||!d.ok){alert('Chyba při vytváření.');return;}
+    myPid=d.pid; roomCode=d.code; isHost=true; lastV=-1;
+    G('lobby-code').textContent=roomCode;
+    G('btn-start').style.display='none';
+    G('lobby-wait').style.display='none';
     show('s-lobby');
     startPoll();
   });
 }
 
 /* JOIN */
-function goJoin() {
-  G('joincode').value = '';
-  G('join-err').textContent = '';
-  show('s-join');
-}
-
-function doJoin() {
+function goJoin(){G('joincode').value='';G('join-err').textContent='';show('s-join');}
+function doJoin(){
   initA();
-  var code = G('joincode').value.trim().toUpperCase();
-  if (code.length !== 4) {
-    G('join-err').textContent = 'Zadej 4-písmenný kód!';
-    return;
-  }
-  G('join-err').textContent = '⏳ Připojuji se...';
-  var name = getName();
-  api('join', {code: code, name: name}, function(err, d) {
-    if (err || !d) {
-      G('join-err').textContent = '❌ Chyba sítě. Zkus znovu.';
-      return;
+  var code=G('joincode').value.trim().toUpperCase();
+  if(code.length!==4){G('join-err').textContent='Zadej 4-písmenný kód!';return;}
+  G('join-err').textContent='⏳ Připojuji se...';
+  var name=getName();
+  apiGet('join',{code:code,name:name},function(err,d){
+    if(err||!d){G('join-err').textContent='❌ Chyba sítě.';return;}
+    if(!d.ok){
+      var msgs={not_found:'❌ Místnost "'+code+'" neexistuje.',full:'❌ Plná.',already_started:'❌ Hra už běží.'};
+      G('join-err').textContent=msgs[d.error]||('❌ '+d.error);return;
     }
-    if (!d.ok) {
-      if (d.error === 'not_found') G('join-err').textContent = '❌ Místnost "' + code + '" neexistuje.';
-      else if (d.error === 'full') G('join-err').textContent = '❌ Místnost je plná.';
-      else if (d.error === 'already_started') G('join-err').textContent = '❌ Hra už běží.';
-      else G('join-err').textContent = '❌ ' + (d.error || 'Chyba');
-      return;
-    }
-    myPid = d.pid;
-    roomCode = code;
-    isHost = false;
-    G('lobby-code').textContent = roomCode;
-    renderLobby(d.players);
-    G('btn-start').style.display = 'none';
-    G('lobby-wait').style.display = 'block';
+    myPid=d.pid; roomCode=code; isHost=false; lastV=-1;
+    G('lobby-code').textContent=roomCode;
+    G('btn-start').style.display='none';
+    G('lobby-wait').style.display='block';
     show('s-lobby');
     startPoll();
   });
 }
 
 /* START */
-function doStart() {
-  if (isHost && hostRoom) {
-    /* Host changes state locally — sync will push it to server */
-    hostRoom.state = 'playing';
-    hostRoom.curQ = 0;
-    hostRoom.qStartTime = Date.now();
-    hostRoom.answers = {};
-    hostRoom.lastUpdate = Date.now();
-    /* Also push to server immediately */
-    api('sync', {code: roomCode, pid: myPid}, function() {}, hostRoom);
-    return;
-  }
-  api('start', {code: roomCode, pid: myPid}, function(err, d) {
-    if (err || !d || !d.ok) {
-      alert('Nepodařilo se spustit hru: ' + (d && d.error ? d.error : 'chyba'));
-    }
+function doStart(){
+  G('btn-start').textContent='⏳ Startuji...';
+  G('btn-start').disabled=true;
+  apiGet('start',{code:roomCode,pid:myPid},function(err,d){
+    G('btn-start').textContent='🚀 Spustit hru!';
+    G('btn-start').disabled=false;
+    if(err||!d||!d.ok) alert('Chyba: '+(d&&d.error?d.error:'?'));
   });
 }
 
-/* POLLING */
-function startPoll() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(doPoll, 1500);
+/* NEXT */
+function doNext(){
+  G('btn-next').style.display='none';
+  apiGet('next',{code:roomCode,pid:myPid},function(){});
 }
 
-function doPoll() {
-  if (isHost && hostRoom) {
-    /* Host: push state to server, get back any pending joins */
-    api('sync', {code: roomCode, pid: myPid}, function(err, d) {
-      if (err || !d || !d.ok) return;
-      /* Merge new players */
-      if (d.newPlayers) {
-        for (var i = 0; i < d.newPlayers.length; i++) {
-          var np = d.newPlayers[i];
-          var exists = false;
-          for (var j = 0; j < hostRoom.players.length; j++) {
-            if (hostRoom.players[j].pid === np.pid) { exists = true; break; }
-          }
-          if (!exists && hostRoom.players.length < 4) hostRoom.players.push(np);
-        }
-      }
-      /* Merge guest answers */
-      if (d.newAnswers) {
-        var akeys = Object.keys(d.newAnswers);
-        for (var i = 0; i < akeys.length; i++) {
-          if (!hostRoom.answers[akeys[i]]) {
-            hostRoom.answers[akeys[i]] = d.newAnswers[akeys[i]];
-          }
-        }
-        /* Check if all answered → resolve round locally */
-        if (hostRoom.state === 'playing' && Object.keys(hostRoom.answers).length >= hostRoom.players.length) {
-          resolveRoundLocal(hostRoom);
-        }
-      }
-      /* Use hostRoom as source of truth */
-      handlePollData(hostRoomToPollData(hostRoom));
-    }, hostRoom);
-    return;
-  }
-  /* Guest: GET sync from server */
-  api('sync', {code: roomCode, pid: myPid}, function(err, d) {
-    if (err || !d || !d.ok) return;
-    handlePollData(d);
-  });
+/* POLLING — all state comes from server */
+function startPoll(){
+  if(pollTimer)clearInterval(pollTimer);
+  doPoll(); // immediate first poll
+  pollTimer=setInterval(doPoll,1500);
 }
 
-function resolveRoundLocal(room) {
-  var q = room.questions[room.curQ];
-  var sp = specType(room.curQ);
-  var maxT = getMaxTime(sp);
-  var mult = sp==='blitz'?2:sp==='finale'?3:1;
-  for (var i = 0; i < room.players.length; i++) {
-    var p = room.players[i];
-    var ans = room.answers[p.pid] || {idx:-1, time:99};
-    var ok = ans.idx === q.c;
-    var pts = 0;
-    if (ok) {
-      p.streak=(p.streak||0)+1; p.correct=(p.correct||0)+1;
-      var speed=Math.round((1-Math.min(ans.time/maxT,1))*50);
-      pts=Math.round((100+speed)*mult*(p.streak>=3?1.5:1));
-      p.score+=pts;
-    } else { p.streak=0; }
-    p.lastPts=pts; p.lastOk=ok;
-  }
-  room.lastCorrectIdx=q.c; room.lastCorrectText=q.a[q.c]; room.state='round-result'; room.lastUpdate=Date.now();
-}
+function doPoll(){
+  apiGet('poll',{code:roomCode,pid:myPid},function(err,d){
+    if(err||!d||!d.ok) return;
 
-function hostRoomToPollData(r) {
-  var myIdx = -1;
-  for (var i = 0; i < r.players.length; i++) {
-    if (r.players[i].pid === myPid) myIdx = i;
-  }
-  var d = {ok:true, state:r.state, players:r.players, myIdx:myIdx, curQ:r.curQ, lastUpdate:r.lastUpdate};
-  if (r.state === 'playing') {
-    var qd = r.questions[r.curQ];
-    d.question = {cat:qd.cat, q:qd.q, a:qd.a, idx:r.curQ};
-    d.qStartTime = r.qStartTime;
-    d.serverTime = Date.now();
-    d.myAnswered = !!r.answers[myPid];
-    d.answeredCount = Object.keys(r.answers).length;
-    d.totalPlayers = r.players.length;
-  }
-  if (r.state === 'round-result') {
-    d.correctIdx = r.lastCorrectIdx;
-    d.correctText = r.lastCorrectText;
-    d.roundPlayers = r.players;
-  }
-  if (r.state === 'final') { d.finalPlayers = r.players; }
-  return d;
-}
+    // Only process if version changed (or first poll)
+    if(d.v===lastV && curScreen!=='s-lobby') return;
+    lastV=d.v;
 
-function handlePollData(d) {
-    players = d.players || [];
+    var players=d.players||[];
 
-    if (d.state === 'lobby') {
+    /* LOBBY */
+    if(d.state==='lobby'){
       renderLobby(players);
-      if (isHost) {
-        G('btn-start').style.display = players.length >= 2 ? 'block' : 'none';
-        G('lobby-wait').style.display = 'none';
+      if(isHost){
+        G('btn-start').style.display=players.length>=2?'block':'none';
+        G('lobby-wait').style.display='none';
       } else {
-        G('btn-start').style.display = 'none';
-        G('lobby-wait').style.display = 'block';
+        G('btn-start').style.display='none';
+        G('lobby-wait').style.display='block';
       }
-      if (curState !== 'lobby') show('s-lobby');
-      curState = 'lobby';
+      if(curScreen!=='s-lobby') show('s-lobby');
     }
 
-    if (d.state === 'playing') {
-      if (curState !== 'playing' || curQ !== d.curQ) {
+    /* PLAYING */
+    if(d.state==='playing'){
+      if(shownQ!==d.curQ){
         // New question
-        curQ = d.curQ;
-        curState = 'playing';
-        myAnswered = false;
+        shownQ=d.curQ;
+        myAnswered=false;
         showQuestion(d);
-      } else if (myAnswered && d.answeredCount) {
-        G('wait-info').textContent = 'Odpovědělo ' + d.answeredCount + '/' + d.totalPlayers + ' hráčů';
+      } else if(myAnswered){
+        // Update answer count
+        if(d.answeredCount) G('wait-info').textContent='Odpovědělo '+d.answeredCount+'/'+d.totalPlayers;
       }
     }
 
-    if (d.state === 'round-result') {
-      if (curState !== 'round-result' || curQ !== d.curQ) {
-        curState = 'round-result';
-        curQ = d.curQ;
+    /* ROUND RESULT */
+    if(d.state==='round-result'){
+      if(curScreen!=='s-round'||shownQ!==d.curQ){
+        shownQ=d.curQ;
         showRoundResult(d);
-        // Host auto-advances after 4s
-        if (isHost) {
-          setTimeout(function() {
-            if (hostRoom) {
-              hostRoom.curQ++;
-              if (hostRoom.curQ >= hostRoom.questions.length) { hostRoom.state = 'final'; }
-              else { hostRoom.state = 'playing'; hostRoom.qStartTime = Date.now(); hostRoom.answers = {}; }
-              hostRoom.lastUpdate = Date.now();
-            }
-            api('next', {code: roomCode, pid: myPid}, function() {});
-          }, 4000);
-        }
       }
     }
 
-    if (d.state === 'final') {
-      if (curState !== 'final') {
-        curState = 'final';
-        showFinal(d.finalPlayers || players);
-      }
+    /* FINAL */
+    if(d.state==='final'){
+      if(curScreen!=='s-final') showFinal(d.finalPlayers||players);
     }
+  });
 }
 
-/* LOBBY */
-function renderLobby(pls) {
-  var h = '';
-  for (var i = 0; i < pls.length; i++) {
-    var p = pls[i];
-    h += '<div class="lp"><div class="dot" style="width:20px;height:20px;background:' + p.color + '"></div><span>' + p.name + '</span></div>';
+/* LOBBY render */
+function renderLobby(pls){
+  var h='';
+  for(var i=0;i<pls.length;i++){
+    var p=pls[i];
+    h+='<div class="lp"><div class="dot" style="width:20px;height:20px;background:'+p.color+'"></div><span>'+p.name+'</span></div>';
   }
-  G('lobby-list').innerHTML = h;
+  G('lobby-list').innerHTML=h;
 }
 
 /* QUESTION */
-function specType(idx){if(idx===4)return'blitz';if(idx===9)return'bet';if(idx===14)return'finale';return''}
-function getMaxTime(sp){if(sp==='blitz')return 7;if(sp==='finale')return 20;return 15}
+function specType(i){if(i===4)return'blitz';if(i===9)return'bet';if(i===14)return'finale';return'';}
+function getMaxTime(s){if(s==='blitz')return 7;if(s==='finale')return 20;return 15;}
 
-function showQuestion(d) {
-  clearInterval(timerInterval);
-  var q = d.question;
-  if (!q) return;
-  var sp = specType(q.idx);
-  maxTime = getMaxTime(sp);
+function showQuestion(d){
+  clearInterval(timerIv);
+  var q=d.question; if(!q)return;
+  var sp=specType(q.idx);
+  maxTime=getMaxTime(sp);
 
   show('s-question');
-  G('prog').style.width = (q.idx / 15 * 100) + '%';
-  G('qnum').textContent = 'Otázka ' + (q.idx + 1) + ' / 15';
+  G('prog').style.width=(q.idx/15*100)+'%';
+  G('qnum').textContent='Otázka '+(q.idx+1)+' / 15';
 
-  var catH = '<span class="cat">' + q.cat + '</span>';
-  if (sp === 'blitz') catH = '<span class="cat special">⚡ BLESKOVÉ KOLO ⚡</span>';
-  if (sp === 'finale') catH = '<span class="cat special">👑 VELKÉ FINÁLE 👑</span>';
-  G('qcat').innerHTML = catH;
-  G('qtxt').textContent = q.q;
-  G('ans-info').textContent = '';
+  var catH='<span class="cat">'+q.cat+'</span>';
+  if(sp==='blitz') catH='<span class="cat special">⚡ BLESKOVÉ KOLO ⚡</span>';
+  if(sp==='finale') catH='<span class="cat special">👑 VELKÉ FINÁLE 👑</span>';
+  G('qcat').innerHTML=catH;
+  G('qtxt').textContent=q.q;
+  G('ans-info').textContent='';
 
-  var labels = ['A','B','C','D'];
-  var aH = '';
-  for (var i = 0; i < q.a.length; i++) {
-    aH += '<button class="ba" id="a' + i + '" onclick="pickAnswer(' + i + ')">' + labels[i] + '. ' + q.a[i] + '</button>';
+  var labels=['A','B','C','D'],aH='';
+  for(var i=0;i<q.a.length;i++){
+    aH+='<button class="ba" id="a'+i+'" onclick="pickAnswer('+i+')">'+labels[i]+'. '+q.a[i]+'</button>';
   }
-  G('ans').innerHTML = aH;
+  G('ans').innerHTML=aH;
 
-  // Timer based on server time
-  var serverElapsed = (d.serverTime - d.qStartTime) / 1000;
-  var remaining = maxTime - serverElapsed;
-  qStartLocal = Date.now() - (serverElapsed * 1000);
+  // If already answered (reconnect scenario)
+  if(d.myAnswered){
+    myAnswered=true;
+    var btns=G('ans').querySelectorAll('.ba');
+    for(var j=0;j<btns.length;j++){btns[j].onclick=null;btns[j].classList.add('dim');}
+    G('ans-info').textContent='✅ Už jsi odpověděl/a';
+    return;
+  }
 
-  G('ttxt').textContent = Math.ceil(Math.max(0, remaining));
-  G('tbar').style.width = (Math.max(0, remaining) / maxTime * 100) + '%';
-  G('tbar').className = 'tbar';
-
-  timerInterval = setInterval(function() {
-    var elapsed = (Date.now() - qStartLocal) / 1000;
-    var rem = maxTime - elapsed;
-    G('tbar').style.width = Math.max(0, rem / maxTime * 100) + '%';
-    if (rem <= 3) G('tbar').className = 'tbar danger';
-    else if (rem <= 6) G('tbar').className = 'tbar warn';
-    G('ttxt').textContent = Math.ceil(Math.max(0, rem));
-    if (rem <= 0.5) try{sndTick()}catch(e){}
-    if (rem <= 0) {
-      clearInterval(timerInterval);
-      if (!myAnswered) {
-        pickAnswer(-1);
-        // Host triggers timeout resolution
-        if (isHost && hostRoom) {
-          for (var ti = 0; ti < hostRoom.players.length; ti++) {
-            if (!hostRoom.answers[hostRoom.players[ti].pid]) hostRoom.answers[hostRoom.players[ti].pid] = {idx:-1, time:99};
-          }
-        }
-        if (isHost) {
-          api('timeout', {code: roomCode, pid: myPid}, function() {});
-        }
-      }
-    }
-  }, 200);
+  var serverElapsed=(d.serverTime-d.qStartTime)/1000;
+  qStartLocal=Date.now()-(serverElapsed*1000);
+  updateTimer();
+  timerIv=setInterval(updateTimer,200);
 }
 
-function pickAnswer(idx) {
-  if (myAnswered) return;
-  myAnswered = true;
+function updateTimer(){
+  var elapsed=(Date.now()-qStartLocal)/1000;
+  var rem=maxTime-elapsed;
+  G('tbar').style.width=Math.max(0,rem/maxTime*100)+'%';
+  if(rem<=3) G('tbar').className='tbar danger';
+  else if(rem<=6) G('tbar').className='tbar warn';
+  else G('tbar').className='tbar';
+  G('ttxt').textContent=Math.ceil(Math.max(0,rem));
+  if(rem<=0){
+    clearInterval(timerIv);
+    if(!myAnswered){
+      pickAnswer(-1);
+      if(isHost) apiGet('timeout',{code:roomCode,pid:myPid},function(){});
+    }
+  }
+}
+
+function pickAnswer(idx){
+  if(myAnswered) return;
+  myAnswered=true;
   initA();
-  clearInterval(timerInterval);
+  clearInterval(timerIv);
+  var elapsed=(Date.now()-qStartLocal)/1000;
 
-  var elapsed = (Date.now() - qStartLocal) / 1000;
-
-  // Visual
-  var btns = G('ans').querySelectorAll('.ba');
-  for (var i = 0; i < btns.length; i++) {
-    btns[i].onclick = null;
-    if (i === idx) btns[i].classList.add('picked');
+  var btns=G('ans').querySelectorAll('.ba');
+  for(var i=0;i<btns.length;i++){
+    btns[i].onclick=null;
+    if(i===idx) btns[i].classList.add('picked');
     else btns[i].classList.add('dim');
   }
 
-  // Send answer
-  if (isHost && hostRoom) {
-    hostRoom.answers[myPid] = {idx: idx, time: parseFloat(elapsed.toFixed(1))};
-    hostRoom.lastUpdate = Date.now();
-  }
-  api('answer', {code: roomCode, pid: myPid, idx: idx, time: elapsed.toFixed(1)}, function() {});
+  apiGet('answer',{code:roomCode,pid:myPid,idx:idx,time:elapsed.toFixed(1)},function(){});
 
-  // Show waiting
-  var icon = idx === -1 ? '⏰' : '✋';
-  var msg = idx === -1 ? 'Čas vypršel!' : 'Odpověď odeslána!';
-  G('my-result').innerHTML = '<div class="ricon">' + icon + '</div><div style="font-size:1.3em;font-weight:700">' + msg + '</div>';
-  G('wait-info').textContent = '';
+  var icon=idx===-1?'⏰':'✋';
+  var msg=idx===-1?'Čas vypršel!':'Odpověď odeslána!';
+  G('my-result').innerHTML='<div class="ricon">'+icon+'</div><div style="font-size:1.3em;font-weight:700">'+msg+'</div>';
+  G('wait-info').textContent='';
   show('s-wait-ans');
-
   try{if(idx>=0)beep(500,.1);else sndBad()}catch(e){}
 }
 
 /* ROUND RESULT */
-function showRoundResult(d) {
-  clearInterval(timerInterval);
-  var me = d.myIdx >= 0 ? d.players[d.myIdx] : null;
-  var ok = me && me.lastOk;
+function showRoundResult(d){
+  clearInterval(timerIv);
+  var me=d.myIdx>=0?d.players[d.myIdx]:null;
+  var ok=me&&me.lastOk;
   try{if(ok)sndOk();else sndBad()}catch(e){}
 
-  var icon = ok ? '✅' : '❌';
-  var m = ok ? 'Správně!' : 'Špatně!';
-  var pts = me && me.lastPts > 0 ? ('+' + me.lastPts + ' bodů') : '0 bodů';
-  G('round-card').innerHTML = '<div class="ricon">' + icon + '</div><div style="font-size:1.3em;font-weight:700">' + m + '</div><div class="rpts">' + pts + '</div><div class="rdet">Správně: ' + d.correctText + '</div>';
-  if (ok) G('round-card').classList.add('pulse');
+  var icon=ok?'✅':'❌';
+  var m=ok?'Správně!':'Špatně!';
+  var pts=me&&me.lastPts>0?('+'+me.lastPts+' bodů'):'0 bodů';
+  G('round-card').innerHTML='<div class="ricon">'+icon+'</div><div style="font-size:1.3em;font-weight:700">'+m+'</div><div class="rpts">'+pts+'</div><div class="rdet">Správně: '+d.correctText+'</div>';
+  if(ok) G('round-card').classList.add('pulse');
   else G('round-card').classList.remove('pulse');
 
-  var sorted = (d.roundPlayers || d.players).slice().sort(function(a, b) { return b.score - a.score });
-  renderScoreboard('round-score', sorted);
+  var sorted=(d.roundPlayers||d.players).slice().sort(function(a,b){return b.score-a.score});
+  renderScoreboard('round-score',sorted);
+
+  if(isHost){
+    G('btn-next').style.display='block';
+    G('round-wait').style.display='none';
+  } else {
+    G('btn-next').style.display='none';
+    G('round-wait').style.display='block';
+  }
   show('s-round');
 }
 
-function renderScoreboard(elId, sorted) {
-  var medals = ['🥇','🥈','🥉','4.'];
-  var h = '';
-  for (var i = 0; i < sorted.length; i++) {
-    var p = sorted[i];
-    var st = p.streak >= 3 ? (' 🔥' + p.streak) : '';
-    h += '<div class="srow"><div class="sleft"><div class="dot" style="width:14px;height:14px;background:' + p.color + '"></div><span class="sname">' + medals[i] + ' ' + p.name + '</span><span class="sstreak">' + st + '</span></div><span class="spts">' + p.score + '</span></div>';
+function renderScoreboard(elId,sorted){
+  var medals=['🥇','🥈','🥉','4.'],h='';
+  for(var i=0;i<sorted.length;i++){
+    var p=sorted[i];
+    var st=p.streak>=3?(' 🔥'+p.streak):'';
+    h+='<div class="srow"><div class="sleft"><div class="dot" style="width:14px;height:14px;background:'+p.color+'"></div><span class="sname">'+medals[i]+' '+p.name+'</span><span class="sstreak">'+st+'</span></div><span class="spts">'+p.score+'</span></div>';
   }
-  G(elId).innerHTML = h;
+  G(elId).innerHTML=h;
 }
 
 /* FINAL */
-function showFinal(pls) {
+function showFinal(pls){
   clearInterval(pollTimer);
-  clearInterval(timerInterval);
+  clearInterval(timerIv);
   try{sndEnd()}catch(e){}
   show('s-final');
-  var sorted = (pls || players).slice().sort(function(a,b){return b.score-a.score});
-  var medals = ['🥇','🥈','🥉','4.'];
-  var order = sorted.length >= 3 ? [1,0,2] : [1,0];
-  var ph = '';
-  for (var oi = 0; oi < order.length; oi++) {
-    var rank = order[oi];
-    if (rank < sorted.length) {
-      var p = sorted[rank];
-      ph += '<div class="pp p' + (rank+1) + '"><div class="medal">' + medals[rank] + '</div><div class="pn" style="color:' + p.color + '">' + p.name + '</div><div class="ps">' + p.score + 'b</div><div class="pbar"></div></div>';
+  var sorted=pls.slice().sort(function(a,b){return b.score-a.score});
+  var medals=['🥇','🥈','🥉','4.'];
+  var order=sorted.length>=3?[1,0,2]:[1,0];
+  var ph='';
+  for(var oi=0;oi<order.length;oi++){
+    var rank=order[oi];
+    if(rank<sorted.length){
+      var p=sorted[rank];
+      ph+='<div class="pp p'+(rank+1)+'"><div class="medal">'+medals[rank]+'</div><div class="pn" style="color:'+p.color+'">'+p.name+'</div><div class="ps">'+p.score+'b</div><div class="pbar"></div></div>';
     }
   }
-  G('podium').innerHTML = ph;
-  renderScoreboard('final-score', sorted);
+  G('podium').innerHTML=ph;
+  renderScoreboard('final-score',sorted);
   spawnConfetti();
 }
 
-function spawnConfetti() {
-  var cols = ['#e94560','#f5c518','#00c853','#2979ff','#ff6d00','#aa00ff','#f50057'];
-  for (var i = 0; i < 60; i++) {
-    var el = document.createElement('div');
-    el.className = 'conf';
-    el.style.left = Math.random()*100 + 'vw';
-    el.style.background = cols[Math.floor(Math.random()*cols.length)];
-    el.style.width = (6+Math.random()*8) + 'px';
-    el.style.height = (6+Math.random()*8) + 'px';
-    el.style.animationDuration = (2+Math.random()*2) + 's';
-    el.style.animationDelay = (Math.random()*1.5) + 's';
+function spawnConfetti(){
+  var cols=['#e94560','#f5c518','#00c853','#2979ff','#ff6d00','#aa00ff','#f50057'];
+  for(var i=0;i<60;i++){
+    var el=document.createElement('div');
+    el.className='conf';
+    el.style.left=Math.random()*100+'vw';
+    el.style.background=cols[Math.floor(Math.random()*cols.length)];
+    el.style.width=(6+Math.random()*8)+'px';
+    el.style.height=(6+Math.random()*8)+'px';
+    el.style.animationDuration=(2+Math.random()*2)+'s';
+    el.style.animationDelay=(Math.random()*1.5)+'s';
     document.body.appendChild(el);
     (function(e){setTimeout(function(){if(e.parentNode)e.parentNode.removeChild(e)},5000)})(el);
   }

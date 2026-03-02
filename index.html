@@ -78,7 +78,7 @@ button:active{transform:scale(.96)}
 <input type="text" id="myname" placeholder="Tvoje jméno" maxlength="12">
 <button class="bp" onclick="doCreate()">🎮 Vytvořit hru</button>
 <button class="bg" onclick="goJoin()">🔗 Připojit se</button>
-<p class="foot">Vytvořeno s ⚡ od Arca | v3.0</p>
+<p class="foot">Vytvořeno s ⚡ od Arca | v3.1</p>
 </div>
 
 <div class="scr" id="s-join">
@@ -147,6 +147,7 @@ var qStartLocal = 0;
 var maxTime = 15;
 var myAnswered = false;
 var timerInterval = null;
+var hostRoom = null; /* host keeps full room state locally */
 
 /* audio */
 var actx = null;
@@ -170,21 +171,22 @@ function getName(){
   return n;
 }
 
-function api(action, params, cb) {
+function api(action, params, cb, postBody) {
   var url = API + '?action=' + action;
   var keys = Object.keys(params || {});
   for (var i = 0; i < keys.length; i++) {
     url += '&' + keys[i] + '=' + encodeURIComponent(params[keys[i]]);
   }
   var xhr = new XMLHttpRequest();
-  xhr.open('GET', url, true);
+  xhr.open(postBody ? 'POST' : 'GET', url, true);
+  if (postBody) xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.onload = function() {
     try { var d = JSON.parse(xhr.responseText); cb(null, d); } catch(e) { cb(e); }
   };
   xhr.onerror = function() { cb(new Error('network')); };
   xhr.timeout = 8000;
   xhr.ontimeout = function() { cb(new Error('timeout')); };
-  xhr.send();
+  xhr.send(postBody ? JSON.stringify(postBody) : null);
 }
 
 /* CREATE */
@@ -199,6 +201,7 @@ function doCreate() {
     myPid = d.pid;
     roomCode = d.code;
     isHost = true;
+    hostRoom = d.room; /* store full room state */
     G('lobby-code').textContent = roomCode;
     renderLobby([{name: name, color: '#e94560', score: 0}]);
     G('btn-start').style.display = 'none';
@@ -250,6 +253,17 @@ function doJoin() {
 
 /* START */
 function doStart() {
+  if (isHost && hostRoom) {
+    /* Host changes state locally — sync will push it to server */
+    hostRoom.state = 'playing';
+    hostRoom.curQ = 0;
+    hostRoom.qStartTime = Date.now();
+    hostRoom.answers = {};
+    hostRoom.lastUpdate = Date.now();
+    /* Also push to server immediately */
+    api('sync', {code: roomCode, pid: myPid}, function() {}, hostRoom);
+    return;
+  }
   api('start', {code: roomCode, pid: myPid}, function(err, d) {
     if (err || !d || !d.ok) {
       alert('Nepodařilo se spustit hru: ' + (d && d.error ? d.error : 'chyba'));
@@ -264,9 +278,58 @@ function startPoll() {
 }
 
 function doPoll() {
-  api('poll', {code: roomCode, pid: myPid}, function(err, d) {
+  if (isHost && hostRoom) {
+    /* Host: push state to server, get back any pending joins */
+    api('sync', {code: roomCode, pid: myPid}, function(err, d) {
+      if (err || !d || !d.ok) return;
+      /* Merge new players */
+      if (d.newPlayers) {
+        for (var i = 0; i < d.newPlayers.length; i++) {
+          var np = d.newPlayers[i];
+          var exists = false;
+          for (var j = 0; j < hostRoom.players.length; j++) {
+            if (hostRoom.players[j].pid === np.pid) { exists = true; break; }
+          }
+          if (!exists && hostRoom.players.length < 4) hostRoom.players.push(np);
+        }
+      }
+      /* Use hostRoom as source of truth */
+      handlePollData(hostRoomToPollData(hostRoom));
+    }, hostRoom);
+    return;
+  }
+  /* Guest: GET sync from server */
+  api('sync', {code: roomCode, pid: myPid}, function(err, d) {
     if (err || !d || !d.ok) return;
+    handlePollData(d);
+  });
+}
 
+function hostRoomToPollData(r) {
+  var myIdx = -1;
+  for (var i = 0; i < r.players.length; i++) {
+    if (r.players[i].pid === myPid) myIdx = i;
+  }
+  var d = {ok:true, state:r.state, players:r.players, myIdx:myIdx, curQ:r.curQ, lastUpdate:r.lastUpdate};
+  if (r.state === 'playing') {
+    var qd = r.questions[r.curQ];
+    d.question = {cat:qd.cat, q:qd.q, a:qd.a, idx:r.curQ};
+    d.qStartTime = r.qStartTime;
+    d.serverTime = Date.now();
+    d.myAnswered = !!r.answers[myPid];
+    d.answeredCount = Object.keys(r.answers).length;
+    d.totalPlayers = r.players.length;
+  }
+  if (r.state === 'round-result') {
+    d.correctIdx = r.lastCorrectIdx;
+    d.correctText = r.lastCorrectText;
+    d.roundPlayers = r.players;
+  }
+  if (r.state === 'final') { d.finalPlayers = r.players; }
+  return d;
+}
+
+function handlePollData(d) {
     players = d.players || [];
 
     if (d.state === 'lobby') {
@@ -302,6 +365,12 @@ function doPoll() {
         // Host auto-advances after 4s
         if (isHost) {
           setTimeout(function() {
+            if (hostRoom) {
+              hostRoom.curQ++;
+              if (hostRoom.curQ >= hostRoom.questions.length) { hostRoom.state = 'final'; }
+              else { hostRoom.state = 'playing'; hostRoom.qStartTime = Date.now(); hostRoom.answers = {}; }
+              hostRoom.lastUpdate = Date.now();
+            }
             api('next', {code: roomCode, pid: myPid}, function() {});
           }, 4000);
         }
@@ -314,7 +383,6 @@ function doPoll() {
         showFinal(d.finalPlayers || players);
       }
     }
-  });
 }
 
 /* LOBBY */
@@ -378,6 +446,11 @@ function showQuestion(d) {
       if (!myAnswered) {
         pickAnswer(-1);
         // Host triggers timeout resolution
+        if (isHost && hostRoom) {
+          for (var ti = 0; ti < hostRoom.players.length; ti++) {
+            if (!hostRoom.answers[hostRoom.players[ti].pid]) hostRoom.answers[hostRoom.players[ti].pid] = {idx:-1, time:99};
+          }
+        }
         if (isHost) {
           api('timeout', {code: roomCode, pid: myPid}, function() {});
         }
@@ -403,6 +476,10 @@ function pickAnswer(idx) {
   }
 
   // Send answer
+  if (isHost && hostRoom) {
+    hostRoom.answers[myPid] = {idx: idx, time: parseFloat(elapsed.toFixed(1))};
+    hostRoom.lastUpdate = Date.now();
+  }
   api('answer', {code: roomCode, pid: myPid, idx: idx, time: elapsed.toFixed(1)}, function() {});
 
   // Show waiting

@@ -1,187 +1,197 @@
-var fs = require('fs');
-var TMP = '/tmp/qr_';
+var https = require('https');
 
-// Room stored per-key in /tmp + global fallback
-if (!global._qr) global._qr = {};
+var GIST_ID = process.env.GIST_ID || 'eb389578a90ecde0773e247dca251a32';
+var GH_TOKEN = process.env.GH_TOKEN;
 
-function loadRoom(code, cb) {
-  // Try global first (fastest, same instance)
-  if (global._qr[code]) { cb(null, JSON.parse(JSON.stringify(global._qr[code]))); return; }
-  // Try /tmp (shared in same sandbox)
-  try {
-    var data = fs.readFileSync(TMP + code + '.json', 'utf8');
-    var room = JSON.parse(data);
-    global._qr[code] = room;
-    cb(null, JSON.parse(JSON.stringify(room)));
-  } catch(e) {
-    cb(null, null);
+function ghReq(method, path, body, cb) {
+  var opts = {
+    hostname: 'api.github.com',
+    path: path,
+    method: method,
+    headers: {
+      'Authorization': 'token ' + GH_TOKEN,
+      'User-Agent': 'quiz-api',
+      'Accept': 'application/vnd.github.v3+json'
+    }
+  };
+  if (body) {
+    var b = JSON.stringify(body);
+    opts.headers['Content-Type'] = 'application/json';
+    opts.headers['Content-Length'] = Buffer.byteLength(b);
   }
+  var req = https.request(opts, function(res) {
+    var data = '';
+    res.on('data', function(c) { data += c; });
+    res.on('end', function() {
+      try { cb(null, JSON.parse(data)); } catch(e) { cb(e); }
+    });
+  });
+  req.on('error', function(e) { cb(e); });
+  if (body) req.write(JSON.stringify(body));
+  req.end();
 }
 
-function saveRoom(code, room, cb) {
-  global._qr[code] = room;
-  try { fs.writeFileSync(TMP + code + '.json', JSON.stringify(room)); } catch(e) {}
-  if (cb) cb(null);
+function loadRooms(cb) {
+  ghReq('GET', '/gists/' + GIST_ID, null, function(err, gist) {
+    if (err || !gist || !gist.files) { cb(err, {}); return; }
+    var f = gist.files['rooms.json'];
+    if (!f || !f.content) { cb(null, {}); return; }
+    try { cb(null, JSON.parse(f.content)); } catch(e) { cb(null, {}); }
+  });
+}
+
+function saveRooms(rooms, cb) {
+  // Clean old rooms (>2 hours)
+  var now = Date.now();
+  var keys = Object.keys(rooms);
+  for (var i = 0; i < keys.length; i++) {
+    if (now - rooms[keys[i]].created > 7200000) delete rooms[keys[i]];
+  }
+  var body = {
+    files: { 'rooms.json': { content: JSON.stringify(rooms) } }
+  };
+  ghReq('PATCH', '/gists/' + GIST_ID, body, function(err) {
+    if (cb) cb(err);
+  });
 }
 
 module.exports = function(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
   var q = req.query || {};
   var action = q.action || '';
 
-  /* CREATE */
-  if (action === 'create') {
-    var name = decodeURIComponent(q.name || 'Hostitel');
-    var code = makeCode();
-    var pid = makeId();
-    var questions = prepQuestions();
-    var room = {
-      created: Date.now(), code: code, state: 'lobby', hostPid: pid,
-      players: [{pid:pid, name:name, color:'#e94560', score:0, streak:0, correct:0}],
-      questions: questions, curQ: 0, qStartTime: 0, answers: {}, lastUpdate: Date.now()
-    };
-    saveRoom(code, room, function() {
-      res.json({ok: true, code: code, pid: pid});
-    });
-    return;
-  }
+  loadRooms(function(err, rooms) {
+    if (err) rooms = {};
 
-  /* JOIN */
-  if (action === 'join') {
-    var jcode = (q.code || '').toUpperCase();
-    var jname = decodeURIComponent(q.name || 'Hráč');
-    loadRoom(jcode, function(err, room) {
-      if (!room) { res.json({ok: false, error: 'not_found'}); return; }
-      if (room.state !== 'lobby') { res.json({ok: false, error: 'already_started'}); return; }
-      if (room.players.length >= 4) { res.json({ok: false, error: 'full'}); return; }
+    /* CREATE */
+    if (action === 'create') {
+      var name = decodeURIComponent(q.name || 'Hostitel');
+      var code = makeCode();
+      while (rooms[code]) code = makeCode();
+      var pid = makeId();
+      rooms[code] = {
+        created: Date.now(), code: code, state: 'lobby', hostPid: pid,
+        players: [{pid:pid, name:name, color:'#e94560', score:0, streak:0, correct:0}],
+        questions: prepQuestions(), curQ: 0, qStartTime: 0, answers: {}, lastUpdate: Date.now()
+      };
+      saveRooms(rooms, function() { res.json({ok:true, code:code, pid:pid}); });
+      return;
+    }
+
+    /* JOIN */
+    if (action === 'join') {
+      var jcode = (q.code || '').toUpperCase();
+      var jname = decodeURIComponent(q.name || 'Hráč');
+      var room = rooms[jcode];
+      if (!room) { res.json({ok:false, error:'not_found'}); return; }
+      if (room.state !== 'lobby') { res.json({ok:false, error:'already_started'}); return; }
+      if (room.players.length >= 4) { res.json({ok:false, error:'full'}); return; }
       var colors = ['#e94560','#2979ff','#00c853','#ff6d00'];
       var jpid = makeId();
       room.players.push({pid:jpid, name:jname, color:colors[room.players.length], score:0, streak:0, correct:0});
       room.lastUpdate = Date.now();
-      saveRoom(jcode, room, function() {
-        res.json({ok: true, pid: jpid, players: stripPids(room.players)});
-      });
-    });
-    return;
-  }
+      saveRooms(rooms, function() { res.json({ok:true, pid:jpid, players:stripPids(room.players)}); });
+      return;
+    }
 
-  /* POLL */
-  if (action === 'poll') {
-    var pcode = (q.code || '').toUpperCase();
-    var ppid = q.pid || '';
-    loadRoom(pcode, function(err, room) {
-      if (!room) { res.json({ok: false, error: 'not_found'}); return; }
+    /* POLL — read only, no save needed */
+    if (action === 'poll') {
+      var pcode = (q.code || '').toUpperCase();
+      var ppid = q.pid || '';
+      var pr = rooms[pcode];
+      if (!pr) { res.json({ok:false, error:'not_found'}); return; }
       var myIdx = -1;
-      for (var i = 0; i < room.players.length; i++) {
-        if (room.players[i].pid === ppid) myIdx = i;
+      for (var i = 0; i < pr.players.length; i++) {
+        if (pr.players[i].pid === ppid) myIdx = i;
       }
-      var resp = {
-        ok: true, state: room.state, players: stripPids(room.players),
-        myIdx: myIdx, curQ: room.curQ, lastUpdate: room.lastUpdate
-      };
-      if (room.state === 'playing') {
-        var qData = room.questions[room.curQ];
-        resp.question = {cat:qData.cat, q:qData.q, a:qData.a, idx:room.curQ};
-        resp.qStartTime = room.qStartTime;
+      var resp = {ok:true, state:pr.state, players:stripPids(pr.players), myIdx:myIdx, curQ:pr.curQ, lastUpdate:pr.lastUpdate};
+      if (pr.state === 'playing') {
+        var qd = pr.questions[pr.curQ];
+        resp.question = {cat:qd.cat, q:qd.q, a:qd.a, idx:pr.curQ};
+        resp.qStartTime = pr.qStartTime;
         resp.serverTime = Date.now();
-        resp.myAnswered = !!room.answers[ppid];
-        resp.answeredCount = Object.keys(room.answers).length;
-        resp.totalPlayers = room.players.length;
+        resp.myAnswered = !!pr.answers[ppid];
+        resp.answeredCount = Object.keys(pr.answers).length;
+        resp.totalPlayers = pr.players.length;
       }
-      if (room.state === 'round-result') {
-        resp.correctIdx = room.lastCorrectIdx;
-        resp.correctText = room.lastCorrectText;
-        resp.roundPlayers = stripPids(room.players);
+      if (pr.state === 'round-result') {
+        resp.correctIdx = pr.lastCorrectIdx;
+        resp.correctText = pr.lastCorrectText;
+        resp.roundPlayers = stripPids(pr.players);
       }
-      if (room.state === 'final') {
-        resp.finalPlayers = stripPids(room.players);
-      }
+      if (pr.state === 'final') { resp.finalPlayers = stripPids(pr.players); }
       res.json(resp);
-    });
-    return;
-  }
+      return;
+    }
 
-  /* START */
-  if (action === 'start') {
-    var scode = (q.code || '').toUpperCase();
-    var spid = q.pid || '';
-    loadRoom(scode, function(err, room) {
-      if (!room) { res.json({ok: false, error: 'not_found'}); return; }
-      if (room.hostPid !== spid) { res.json({ok: false, error: 'not_host'}); return; }
-      if (room.players.length < 2) { res.json({ok: false, error: 'need_more'}); return; }
-      room.state = 'playing';
-      room.curQ = 0;
-      room.qStartTime = Date.now();
-      room.answers = {};
-      room.lastUpdate = Date.now();
-      saveRoom(scode, room, function() { res.json({ok: true}); });
-    });
-    return;
-  }
+    /* START */
+    if (action === 'start') {
+      var sc = (q.code || '').toUpperCase();
+      var sp = q.pid || '';
+      var sr = rooms[sc];
+      if (!sr) { res.json({ok:false, error:'not_found'}); return; }
+      if (sr.hostPid !== sp) { res.json({ok:false, error:'not_host'}); return; }
+      if (sr.players.length < 2) { res.json({ok:false, error:'need_more'}); return; }
+      sr.state = 'playing'; sr.curQ = 0; sr.qStartTime = Date.now(); sr.answers = {}; sr.lastUpdate = Date.now();
+      saveRooms(rooms, function() { res.json({ok:true}); });
+      return;
+    }
 
-  /* ANSWER */
-  if (action === 'answer') {
-    var acode = (q.code || '').toUpperCase();
-    var apid = q.pid || '';
-    var aidx = parseInt(q.idx);
-    var atime = parseFloat(q.time) || 15;
-    loadRoom(acode, function(err, room) {
-      if (!room) { res.json({ok: false, error: 'not_found'}); return; }
-      if (room.state !== 'playing') { res.json({ok: false, error: 'not_playing'}); return; }
-      if (room.answers[apid]) { res.json({ok: false, error: 'already_answered'}); return; }
-      room.answers[apid] = {idx: aidx, time: atime};
-      room.lastUpdate = Date.now();
-      if (Object.keys(room.answers).length >= room.players.length) {
-        resolveRound(room);
+    /* ANSWER */
+    if (action === 'answer') {
+      var ac = (q.code || '').toUpperCase();
+      var ap = q.pid || '';
+      var ai = parseInt(q.idx);
+      var at = parseFloat(q.time) || 15;
+      var ar = rooms[ac];
+      if (!ar) { res.json({ok:false, error:'not_found'}); return; }
+      if (ar.state !== 'playing') { res.json({ok:false, error:'not_playing'}); return; }
+      if (ar.answers[ap]) { res.json({ok:false, error:'already_answered'}); return; }
+      ar.answers[ap] = {idx:ai, time:at};
+      ar.lastUpdate = Date.now();
+      if (Object.keys(ar.answers).length >= ar.players.length) resolveRound(ar);
+      saveRooms(rooms, function() { res.json({ok:true, answeredCount:Object.keys(ar.answers).length}); });
+      return;
+    }
+
+    /* TIMEOUT */
+    if (action === 'timeout') {
+      var tc = (q.code || '').toUpperCase();
+      var tp = q.pid || '';
+      var tr = rooms[tc];
+      if (!tr) { res.json({ok:false, error:'not_found'}); return; }
+      if (tr.hostPid !== tp) { res.json({ok:false, error:'not_host'}); return; }
+      if (tr.state !== 'playing') { res.json({ok:false}); return; }
+      for (var ti = 0; ti < tr.players.length; ti++) {
+        if (!tr.answers[tr.players[ti].pid]) tr.answers[tr.players[ti].pid] = {idx:-1, time:99};
       }
-      saveRoom(acode, room, function() {
-        res.json({ok: true, answeredCount: Object.keys(room.answers).length});
-      });
-    });
-    return;
-  }
+      resolveRound(tr);
+      saveRooms(rooms, function() { res.json({ok:true}); });
+      return;
+    }
 
-  /* TIMEOUT */
-  if (action === 'timeout') {
-    var tcode = (q.code || '').toUpperCase();
-    var tpid = q.pid || '';
-    loadRoom(tcode, function(err, room) {
-      if (!room) { res.json({ok: false, error: 'not_found'}); return; }
-      if (room.hostPid !== tpid) { res.json({ok: false, error: 'not_host'}); return; }
-      if (room.state !== 'playing') { res.json({ok: false}); return; }
-      for (var i = 0; i < room.players.length; i++) {
-        if (!room.answers[room.players[i].pid]) {
-          room.answers[room.players[i].pid] = {idx: -1, time: 99};
-        }
-      }
-      resolveRound(room);
-      saveRoom(tcode, room, function() { res.json({ok: true}); });
-    });
-    return;
-  }
+    /* NEXT */
+    if (action === 'next') {
+      var nc = (q.code || '').toUpperCase();
+      var np = q.pid || '';
+      var nr = rooms[nc];
+      if (!nr) { res.json({ok:false, error:'not_found'}); return; }
+      if (nr.hostPid !== np) { res.json({ok:false, error:'not_host'}); return; }
+      nr.curQ++;
+      if (nr.curQ >= nr.questions.length) { nr.state = 'final'; }
+      else { nr.state = 'playing'; nr.qStartTime = Date.now(); nr.answers = {}; }
+      nr.lastUpdate = Date.now();
+      saveRooms(rooms, function() { res.json({ok:true, state:nr.state}); });
+      return;
+    }
 
-  /* NEXT */
-  if (action === 'next') {
-    var ncode = (q.code || '').toUpperCase();
-    var npid = q.pid || '';
-    loadRoom(ncode, function(err, room) {
-      if (!room) { res.json({ok: false, error: 'not_found'}); return; }
-      if (room.hostPid !== npid) { res.json({ok: false, error: 'not_host'}); return; }
-      room.curQ++;
-      if (room.curQ >= room.questions.length) { room.state = 'final'; }
-      else { room.state = 'playing'; room.qStartTime = Date.now(); room.answers = {}; }
-      room.lastUpdate = Date.now();
-      saveRoom(ncode, room, function() { res.json({ok: true, state: room.state}); });
-    });
-    return;
-  }
-
-  res.json({error: 'unknown_action'});
+    res.json({error:'unknown_action'});
+  });
 };
 
 /* ===== HELPERS ===== */
@@ -189,27 +199,21 @@ function resolveRound(room) {
   var q = room.questions[room.curQ];
   var sp = specType(room.curQ);
   var maxT = getMaxTime(sp);
-  var mult = 1;
-  if (sp === 'blitz') mult = 2;
-  if (sp === 'finale') mult = 3;
+  var mult = sp==='blitz'?2:sp==='finale'?3:1;
   for (var i = 0; i < room.players.length; i++) {
     var p = room.players[i];
     var ans = room.answers[p.pid] || {idx:-1, time:99};
     var ok = ans.idx === q.c;
     var pts = 0;
     if (ok) {
-      p.streak = (p.streak||0)+1; p.correct = (p.correct||0)+1;
-      var speed = Math.round((1-Math.min(ans.time/maxT,1))*50);
-      var sm = p.streak >= 3 ? 1.5 : 1;
-      pts = Math.round((100+speed)*mult*sm);
-      p.score += pts;
-    } else { p.streak = 0; }
-    p.lastPts = pts; p.lastOk = ok;
+      p.streak=(p.streak||0)+1; p.correct=(p.correct||0)+1;
+      var speed=Math.round((1-Math.min(ans.time/maxT,1))*50);
+      pts=Math.round((100+speed)*mult*(p.streak>=3?1.5:1));
+      p.score+=pts;
+    } else { p.streak=0; }
+    p.lastPts=pts; p.lastOk=ok;
   }
-  room.lastCorrectIdx = q.c;
-  room.lastCorrectText = q.a[q.c];
-  room.state = 'round-result';
-  room.lastUpdate = Date.now();
+  room.lastCorrectIdx=q.c; room.lastCorrectText=q.a[q.c]; room.state='round-result'; room.lastUpdate=Date.now();
 }
 function specType(i){if(i===4)return'blitz';if(i===9)return'bet';if(i===14)return'finale';return'';}
 function getMaxTime(s){if(s==='blitz')return 7;if(s==='finale')return 20;return 15;}

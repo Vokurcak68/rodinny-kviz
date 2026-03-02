@@ -45,27 +45,44 @@ module.exports = function(req, res) {
         var room;
         try { room = JSON.parse(body); } catch(e) { res.json({ok:false, error:'bad_json'}); return; }
         if (!room || room.hostPid !== pid) { res.json({ok:false, error:'not_host'}); return; }
-        // Merge pending joins from cache (if any)
+        // Merge from cache: pending joins + guest answers
         var cached = readRoom(code);
         var newPlayers = [];
-        if (cached && cached._pendingJoins) {
-          for (var i = 0; i < cached._pendingJoins.length; i++) {
-            var pj = cached._pendingJoins[i];
-            // Check not already in room
-            var exists = false;
-            for (var j = 0; j < room.players.length; j++) {
-              if (room.players[j].pid === pj.pid) { exists = true; break; }
-            }
-            if (!exists && room.players.length < 4) {
-              room.players.push(pj);
-              newPlayers.push(pj);
+        var newAnswers = {};
+        if (cached) {
+          // Merge pending joins
+          if (cached._pendingJoins) {
+            for (var i = 0; i < cached._pendingJoins.length; i++) {
+              var pj = cached._pendingJoins[i];
+              var exists = false;
+              for (var j = 0; j < room.players.length; j++) {
+                if (room.players[j].pid === pj.pid) { exists = true; break; }
+              }
+              if (!exists && room.players.length < 4) {
+                room.players.push(pj);
+                newPlayers.push(pj);
+              }
             }
           }
+          // Merge guest answers (answers in cache that host doesn't have yet)
+          if (cached.answers) {
+            var ckeys = Object.keys(cached.answers);
+            for (var k = 0; k < ckeys.length; k++) {
+              if (!room.answers[ckeys[k]]) {
+                room.answers[ckeys[k]] = cached.answers[ckeys[k]];
+                newAnswers[ckeys[k]] = cached.answers[ckeys[k]];
+              }
+            }
+          }
+        }
+        // Check if all answered after merge → resolve round
+        if (room.state === 'playing' && Object.keys(room.answers).length >= room.players.length) {
+          resolveRound(room);
         }
         room.lastUpdate = Date.now();
         room._pendingJoins = [];
         writeRoom(code, room);
-        res.json({ok: true, newPlayers: newPlayers});
+        res.json({ok: true, newPlayers: newPlayers, newAnswers: newAnswers, answeredCount: Object.keys(room.answers).length});
       });
       return;
     }

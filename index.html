@@ -78,7 +78,7 @@ button:active{transform:scale(.96)}
 <input type="text" id="myname" placeholder="Tvoje jméno" maxlength="12">
 <button class="bp" onclick="doCreate()">🎮 Vytvořit hru</button>
 <button class="bg" onclick="goJoin()">🔗 Připojit se</button>
-<p class="foot">Vytvořeno s ⚡ od Arca | v3.1</p>
+<p class="foot">Vytvořeno s ⚡ od Arca | v3.2</p>
 </div>
 
 <div class="scr" id="s-join">
@@ -293,6 +293,19 @@ function doPoll() {
           if (!exists && hostRoom.players.length < 4) hostRoom.players.push(np);
         }
       }
+      /* Merge guest answers */
+      if (d.newAnswers) {
+        var akeys = Object.keys(d.newAnswers);
+        for (var i = 0; i < akeys.length; i++) {
+          if (!hostRoom.answers[akeys[i]]) {
+            hostRoom.answers[akeys[i]] = d.newAnswers[akeys[i]];
+          }
+        }
+        /* Check if all answered → resolve round locally */
+        if (hostRoom.state === 'playing' && Object.keys(hostRoom.answers).length >= hostRoom.players.length) {
+          resolveRoundLocal(hostRoom);
+        }
+      }
       /* Use hostRoom as source of truth */
       handlePollData(hostRoomToPollData(hostRoom));
     }, hostRoom);
@@ -303,6 +316,27 @@ function doPoll() {
     if (err || !d || !d.ok) return;
     handlePollData(d);
   });
+}
+
+function resolveRoundLocal(room) {
+  var q = room.questions[room.curQ];
+  var sp = specType(room.curQ);
+  var maxT = getMaxTime(sp);
+  var mult = sp==='blitz'?2:sp==='finale'?3:1;
+  for (var i = 0; i < room.players.length; i++) {
+    var p = room.players[i];
+    var ans = room.answers[p.pid] || {idx:-1, time:99};
+    var ok = ans.idx === q.c;
+    var pts = 0;
+    if (ok) {
+      p.streak=(p.streak||0)+1; p.correct=(p.correct||0)+1;
+      var speed=Math.round((1-Math.min(ans.time/maxT,1))*50);
+      pts=Math.round((100+speed)*mult*(p.streak>=3?1.5:1));
+      p.score+=pts;
+    } else { p.streak=0; }
+    p.lastPts=pts; p.lastOk=ok;
+  }
+  room.lastCorrectIdx=q.c; room.lastCorrectText=q.a[q.c]; room.state='round-result'; room.lastUpdate=Date.now();
 }
 
 function hostRoomToPollData(r) {

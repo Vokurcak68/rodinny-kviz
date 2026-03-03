@@ -1,4 +1,4 @@
-// Quiz API v4 — Pure server-side state, /tmp + global cache with fallback header
+// Quiz API v5 — Answers carried in every poll for cross-instance reliability
 var fs = require('fs');
 var TMP = '/tmp/qr_';
 if (!global._qr) global._qr = {};
@@ -19,24 +19,12 @@ function writeRoom(code, room) {
 module.exports = function(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Room-Backup');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
   var q = req.query || {};
   var action = q.action || '';
-
-  // If host sends room backup in header (base64), restore it if missing
-  var backup = req.headers['x-room-backup'];
-  if (backup && q.code) {
-    var bcode = q.code.toUpperCase();
-    if (!readRoom(bcode)) {
-      try {
-        var restored = JSON.parse(Buffer.from(backup, 'base64').toString());
-        if (restored && restored.code === bcode) writeRoom(bcode, restored);
-      } catch(e) {}
-    }
-  }
 
   /* CREATE */
   if (action === 'create') {
@@ -51,7 +39,7 @@ module.exports = function(req, res) {
       lastUpdate: Date.now()
     };
     writeRoom(code, room);
-    res.json({ok:true, code:code, pid:pid});
+    res.json({ok: true, code: code, pid: pid});
     return;
   }
 
@@ -59,11 +47,11 @@ module.exports = function(req, res) {
   if (action === 'join') {
     var code = (q.code||'').toUpperCase();
     var name = decodeURIComponent(q.name||'Hráč');
+    var jr = q.junior === '1';
     var room = readRoom(code);
     if (!room) { res.json({ok:false,error:'not_found'}); return; }
     if (room.state !== 'lobby') { res.json({ok:false,error:'already_started'}); return; }
     if (room.players.length >= 4) { res.json({ok:false,error:'full'}); return; }
-    var jr = q.junior === '1';
     var pid = makeId();
     var colors = ['#e94560','#2979ff','#00c853','#ff6d00'];
     room.players.push({pid:pid,name:name,color:colors[room.players.length],score:0,streak:0,correct:0,junior:jr});
@@ -73,12 +61,27 @@ module.exports = function(req, res) {
     return;
   }
 
-  /* POLL */
+  /* POLL — clients send their own answer in every poll for cross-instance merge */
   if (action === 'poll') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
     var room = readRoom(code);
     if (!room) { res.json({ok:false,error:'not_found'}); return; }
+
+    // Merge answer from this client if provided and room is playing
+    if (room.state === 'playing' && q.myAns !== undefined && q.myAns !== '' && !room.answers[pid]) {
+      var parts = q.myAns.split(':'); // format: "idx:time" e.g. "2:4.3"
+      if (parts.length === 2) {
+        room.answers[pid] = {idx:parseInt(parts[0]), time:parseFloat(parts[1])};
+        // Check if all answered
+        if (Object.keys(room.answers).length >= room.players.length) {
+          resolveRound(room);
+        }
+        room.v++; room.lastUpdate = Date.now();
+        writeRoom(code, room);
+      }
+    }
+
     var myIdx = -1;
     for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) myIdx=i;
     var r = {ok:true, v:room.v, state:room.state, players:stripPids(room.players),
@@ -103,6 +106,26 @@ module.exports = function(req, res) {
     return;
   }
 
+  /* ANSWER — still accept direct answer calls too */
+  if (action === 'answer') {
+    var code = (q.code||'').toUpperCase();
+    var pid = q.pid||'';
+    var aidx = parseInt(q.idx);
+    var atime = parseFloat(q.time)||15;
+    var room = readRoom(code);
+    if (!room) { res.json({ok:false,error:'not_found'}); return; }
+    if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
+    if (room.answers[pid]) { res.json({ok:true,answeredCount:Object.keys(room.answers).length}); return; }
+    room.answers[pid] = {idx:aidx, time:atime};
+    if (Object.keys(room.answers).length >= room.players.length) {
+      resolveRound(room);
+    }
+    room.v++; room.lastUpdate = Date.now();
+    writeRoom(code, room);
+    res.json({ok:true, answeredCount:Object.keys(room.answers).length});
+    return;
+  }
+
   /* START */
   if (action === 'start') {
     var code = (q.code||'').toUpperCase();
@@ -118,28 +141,7 @@ module.exports = function(req, res) {
     return;
   }
 
-  /* ANSWER */
-  if (action === 'answer') {
-    var code = (q.code||'').toUpperCase();
-    var pid = q.pid||'';
-    var aidx = parseInt(q.idx);
-    var atime = parseFloat(q.time)||15;
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
-    if (room.answers[pid]) { res.json({ok:true,answeredCount:Object.keys(room.answers).length}); return; }
-    room.answers[pid] = {idx:aidx, time:atime};
-    // Auto-resolve if all answered
-    if (Object.keys(room.answers).length >= room.players.length) {
-      resolveRound(room);
-    }
-    room.v++; room.lastUpdate = Date.now();
-    writeRoom(code, room);
-    res.json({ok:true, answeredCount:Object.keys(room.answers).length});
-    return;
-  }
-
-  /* TIMEOUT — host says time is up */
+  /* TIMEOUT */
   if (action === 'timeout') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
@@ -174,14 +176,13 @@ module.exports = function(req, res) {
     return;
   }
 
-  /* HINT 50:50 — server picks 2 wrong answers to hide */
+  /* HINT 50:50 */
   if (action === 'hint5050') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
     var room = readRoom(code);
     if (!room) { res.json({ok:false,error:'not_found'}); return; }
     if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
-    // Find player
     var pl = null;
     for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) pl=room.players[i];
     if (!pl || !pl.junior) { res.json({ok:false,error:'not_junior'}); return; }
@@ -194,19 +195,6 @@ module.exports = function(req, res) {
     var hide = wrong.slice(0,2);
     writeRoom(code, room);
     res.json({ok:true, hide:hide, remaining:3-pl.hints5050used});
-    return;
-  }
-
-  /* BACKUP — host periodically saves full room */
-  if (action === 'backup') {
-    if (req.method !== 'POST') { res.json({ok:false}); return; }
-    collectBody(req, function(body) {
-      try {
-        var room = JSON.parse(body);
-        if (room && room.code) writeRoom(room.code, room);
-        res.json({ok:true});
-      } catch(e) { res.json({ok:false}); }
-    });
     return;
   }
 

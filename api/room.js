@@ -133,11 +133,11 @@ module.exports = function(req, res) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
 
       var changed = false;
-      // Merge answer from poll param
+      // Merge answer from poll param (format: "qNum:idx:time")
       if (room.state === 'playing' && q.myAns && !room.answers[pid]) {
         var parts = q.myAns.split(':');
-        if (parts.length === 2) {
-          room.answers[pid] = {idx:parseInt(parts[0]), time:parseFloat(parts[1])};
+        if (parts.length === 3 && parseInt(parts[0]) === room.curQ) {
+          room.answers[pid] = {idx:parseInt(parts[1]), time:parseFloat(parts[2])};
           changed = true;
           if (Object.keys(room.answers).length >= room.players.length) {
             resolveRound(room);

@@ -1,19 +1,60 @@
-// Quiz API v5 — Answers carried in every poll for cross-instance reliability
-var fs = require('fs');
-var TMP = '/tmp/qr_';
-if (!global._qr) global._qr = {};
+// Quiz API v6 — GitHub Gist as shared storage (cross-instance safe)
+var https = require('https');
+var GIST_ID = process.env.GIST_ID || 'eb389578a90ecde0773e247dca251a32';
+var GH_TOKEN = process.env.GH_TOKEN || '';
 
-function readRoom(code) {
-  if (global._qr[code]) return global._qr[code];
-  try {
-    var d = JSON.parse(fs.readFileSync(TMP + code, 'utf8'));
-    global._qr[code] = d;
-    return d;
-  } catch(e) { return null; }
+// In-memory cache with short TTL to reduce Gist reads
+var cache = {};
+var CACHE_TTL = 800; // ms
+
+function gistReq(method, body, cb) {
+  var opts = {
+    hostname: 'api.github.com',
+    path: '/gists/' + GIST_ID,
+    method: method,
+    headers: {
+      'User-Agent': 'quiz-app',
+      'Authorization': 'token ' + GH_TOKEN,
+      'Accept': 'application/vnd.github.v3+json'
+    }
+  };
+  if (body) opts.headers['Content-Type'] = 'application/json';
+  var req = https.request(opts, function(res) {
+    var d = '';
+    res.on('data', function(c) { d += c; });
+    res.on('end', function() {
+      try { cb(null, JSON.parse(d)); } catch(e) { cb(e); }
+    });
+  });
+  req.on('error', function(e) { cb(e); });
+  req.setTimeout(6000, function() { req.destroy(); cb(new Error('timeout')); });
+  if (body) req.write(JSON.stringify(body));
+  req.end();
 }
-function writeRoom(code, room) {
-  global._qr[code] = room;
-  try { fs.writeFileSync(TMP + code, JSON.stringify(room)); } catch(e) {}
+
+function readRoom(code, cb) {
+  var c = cache[code];
+  if (c && (Date.now() - c.t) < CACHE_TTL) { cb(null, c.room); return; }
+  gistReq('GET', null, function(err, gist) {
+    if (err || !gist || !gist.files) { cb(err || new Error('no gist')); return; }
+    var fname = 'room_' + code + '.json';
+    if (!gist.files[fname]) { cb(null, null); return; }
+    try {
+      var room = JSON.parse(gist.files[fname].content);
+      cache[code] = {room: room, t: Date.now()};
+      cb(null, room);
+    } catch(e) { cb(e); }
+  });
+}
+
+function writeRoom(code, room, cb) {
+  cache[code] = {room: room, t: Date.now()};
+  var fname = 'room_' + code + '.json';
+  var files = {};
+  files[fname] = {content: JSON.stringify(room)};
+  gistReq('PATCH', {files: files}, function(err) {
+    if (cb) cb(err);
+  });
 }
 
 module.exports = function(req, res) {
@@ -22,6 +63,8 @@ module.exports = function(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
+
+  if (!GH_TOKEN) { res.json({ok:false,error:'no_token'}); return; }
 
   var q = req.query || {};
   var action = q.action || '';
@@ -38,8 +81,10 @@ module.exports = function(req, res) {
       questions: prepQuestions(), curQ: 0, qStartTime: 0, answers: {},
       lastUpdate: Date.now()
     };
-    writeRoom(code, room);
-    res.json({ok: true, code: code, pid: pid});
+    writeRoom(code, room, function(err) {
+      if (err) { res.json({ok:false,error:'write_fail'}); return; }
+      res.json({ok: true, code: code, pid: pid});
+    });
     return;
   }
 
@@ -48,81 +93,71 @@ module.exports = function(req, res) {
     var code = (q.code||'').toUpperCase();
     var name = decodeURIComponent(q.name||'Hráč');
     var jr = q.junior === '1';
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.state !== 'lobby') { res.json({ok:false,error:'already_started'}); return; }
-    if (room.players.length >= 4) { res.json({ok:false,error:'full'}); return; }
-    var pid = makeId();
-    var colors = ['#e94560','#2979ff','#00c853','#ff6d00'];
-    room.players.push({pid:pid,name:name,color:colors[room.players.length],score:0,streak:0,correct:0,junior:jr});
-    room.v++; room.lastUpdate = Date.now();
-    writeRoom(code, room);
-    res.json({ok:true, pid:pid, players:stripPids(room.players)});
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
+      if (room.state !== 'lobby') { res.json({ok:false,error:'already_started'}); return; }
+      if (room.players.length >= 4) { res.json({ok:false,error:'full'}); return; }
+      var pid = makeId();
+      var colors = ['#e94560','#2979ff','#00c853','#ff6d00'];
+      room.players.push({pid:pid,name:name,color:colors[room.players.length],score:0,streak:0,correct:0,junior:jr});
+      room.v++; room.lastUpdate = Date.now();
+      writeRoom(code, room, function(err2) {
+        if (err2) { res.json({ok:false,error:'write_fail'}); return; }
+        res.json({ok:true, pid:pid, players:stripPids(room.players)});
+      });
+    });
     return;
   }
 
-  /* POLL — clients send their own answer in every poll for cross-instance merge */
+  /* POLL */
   if (action === 'poll') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
 
-    // Merge answer from this client if provided and room is playing
-    if (room.state === 'playing' && q.myAns !== undefined && q.myAns !== '' && !room.answers[pid]) {
-      var parts = q.myAns.split(':'); // format: "idx:time" e.g. "2:4.3"
-      if (parts.length === 2) {
-        room.answers[pid] = {idx:parseInt(parts[0]), time:parseFloat(parts[1])};
-        // Check if all answered
-        if (Object.keys(room.answers).length >= room.players.length) {
-          resolveRound(room);
+      var changed = false;
+      // Merge answer from poll param
+      if (room.state === 'playing' && q.myAns && !room.answers[pid]) {
+        var parts = q.myAns.split(':');
+        if (parts.length === 2) {
+          room.answers[pid] = {idx:parseInt(parts[0]), time:parseFloat(parts[1])};
+          changed = true;
+          if (Object.keys(room.answers).length >= room.players.length) {
+            resolveRound(room);
+          }
+          room.v++; room.lastUpdate = Date.now();
         }
-        room.v++; room.lastUpdate = Date.now();
-        writeRoom(code, room);
       }
-    }
 
-    var myIdx = -1;
-    for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) myIdx=i;
-    var r = {ok:true, v:room.v, state:room.state, players:stripPids(room.players),
-             myIdx:myIdx, curQ:room.curQ};
-    if (room.state === 'playing') {
-      var qd = room.questions[room.curQ];
-      r.question = {cat:qd.cat, q:qd.q, a:qd.a, idx:room.curQ};
-      r.qStartTime = room.qStartTime;
-      r.serverTime = Date.now();
-      r.myAnswered = !!room.answers[pid];
-      r.answeredCount = Object.keys(room.answers).length;
-      r.totalPlayers = room.players.length;
-    }
-    if (room.state === 'round-result') {
-      r.correctIdx = room.lastCorrectIdx;
-      r.correctText = room.lastCorrectText;
-      r.roundPlayers = stripPids(room.players);
-      r.curQ = room.curQ;
-    }
-    if (room.state === 'final') r.finalPlayers = stripPids(room.players);
-    res.json(r);
+      if (changed) {
+        writeRoom(code, room, function() { sendPoll(res, room, pid); });
+      } else {
+        sendPoll(res, room, pid);
+      }
+    });
     return;
   }
 
-  /* ANSWER — still accept direct answer calls too */
+  /* ANSWER */
   if (action === 'answer') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
     var aidx = parseInt(q.idx);
     var atime = parseFloat(q.time)||15;
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
-    if (room.answers[pid]) { res.json({ok:true,answeredCount:Object.keys(room.answers).length}); return; }
-    room.answers[pid] = {idx:aidx, time:atime};
-    if (Object.keys(room.answers).length >= room.players.length) {
-      resolveRound(room);
-    }
-    room.v++; room.lastUpdate = Date.now();
-    writeRoom(code, room);
-    res.json({ok:true, answeredCount:Object.keys(room.answers).length});
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
+      if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
+      if (room.answers[pid]) { res.json({ok:true,answeredCount:Object.keys(room.answers).length}); return; }
+      room.answers[pid] = {idx:aidx, time:atime};
+      if (Object.keys(room.answers).length >= room.players.length) {
+        resolveRound(room);
+      }
+      room.v++; room.lastUpdate = Date.now();
+      writeRoom(code, room, function() {
+        res.json({ok:true, answeredCount:Object.keys(room.answers).length});
+      });
+    });
     return;
   }
 
@@ -130,14 +165,16 @@ module.exports = function(req, res) {
   if (action === 'start') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
-    if (room.players.length < 2) { res.json({ok:false,error:'need_more'}); return; }
-    room.state = 'playing'; room.curQ = 0; room.qStartTime = Date.now();
-    room.answers = {}; room.v++; room.lastUpdate = Date.now();
-    writeRoom(code, room);
-    res.json({ok:true});
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
+      if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
+      if (room.players.length < 2) { res.json({ok:false,error:'need_more'}); return; }
+      room.state = 'playing'; room.curQ = 0; room.qStartTime = Date.now();
+      room.answers = {}; room.v++; room.lastUpdate = Date.now();
+      writeRoom(code, room, function() {
+        res.json({ok:true});
+      });
+    });
     return;
   }
 
@@ -145,17 +182,19 @@ module.exports = function(req, res) {
   if (action === 'timeout') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
-    if (room.state !== 'playing') { res.json({ok:true}); return; }
-    for (var i=0;i<room.players.length;i++) {
-      if (!room.answers[room.players[i].pid]) room.answers[room.players[i].pid]={idx:-1,time:99};
-    }
-    resolveRound(room);
-    room.v++; room.lastUpdate = Date.now();
-    writeRoom(code, room);
-    res.json({ok:true});
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
+      if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
+      if (room.state !== 'playing') { res.json({ok:true}); return; }
+      for (var i=0;i<room.players.length;i++) {
+        if (!room.answers[room.players[i].pid]) room.answers[room.players[i].pid]={idx:-1,time:99};
+      }
+      resolveRound(room);
+      room.v++; room.lastUpdate = Date.now();
+      writeRoom(code, room, function() {
+        res.json({ok:true});
+      });
+    });
     return;
   }
 
@@ -163,16 +202,18 @@ module.exports = function(req, res) {
   if (action === 'next') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
-    if (room.state !== 'round-result') { res.json({ok:true,state:room.state}); return; }
-    room.curQ++;
-    if (room.curQ >= room.questions.length) { room.state = 'final'; }
-    else { room.state = 'playing'; room.qStartTime = Date.now(); room.answers = {}; }
-    room.v++; room.lastUpdate = Date.now();
-    writeRoom(code, room);
-    res.json({ok:true, state:room.state});
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
+      if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
+      if (room.state !== 'round-result') { res.json({ok:true,state:room.state}); return; }
+      room.curQ++;
+      if (room.curQ >= room.questions.length) { room.state = 'final'; }
+      else { room.state = 'playing'; room.qStartTime = Date.now(); room.answers = {}; }
+      room.v++; room.lastUpdate = Date.now();
+      writeRoom(code, room, function() {
+        res.json({ok:true, state:room.state});
+      });
+    });
     return;
   }
 
@@ -180,28 +221,52 @@ module.exports = function(req, res) {
   if (action === 'hint5050') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    var room = readRoom(code);
-    if (!room) { res.json({ok:false,error:'not_found'}); return; }
-    if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
-    var pl = null;
-    for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) pl=room.players[i];
-    if (!pl || !pl.junior) { res.json({ok:false,error:'not_junior'}); return; }
-    if ((pl.hints5050used||0) >= 3) { res.json({ok:false,error:'no_hints'}); return; }
-    pl.hints5050used = (pl.hints5050used||0)+1;
-    var qd = room.questions[room.curQ];
-    var wrong = [];
-    for (var j=0;j<qd.a.length;j++) if (j!==qd.c) wrong.push(j);
-    wrong.sort(function(){return Math.random()-0.5});
-    var hide = wrong.slice(0,2);
-    writeRoom(code, room);
-    res.json({ok:true, hide:hide, remaining:3-pl.hints5050used});
+    readRoom(code, function(err, room) {
+      if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
+      if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
+      var pl = null;
+      for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) pl=room.players[i];
+      if (!pl || !pl.junior) { res.json({ok:false,error:'not_junior'}); return; }
+      if ((pl.hints5050used||0) >= 3) { res.json({ok:false,error:'no_hints'}); return; }
+      pl.hints5050used = (pl.hints5050used||0)+1;
+      var qd = room.questions[room.curQ];
+      var wrong = [];
+      for (var j=0;j<qd.a.length;j++) if (j!==qd.c) wrong.push(j);
+      wrong.sort(function(){return Math.random()-0.5});
+      var hide = wrong.slice(0,2);
+      writeRoom(code, room, function() {
+        res.json({ok:true, hide:hide, remaining:3-pl.hints5050used});
+      });
+    });
     return;
   }
 
   res.json({error:'unknown_action'});
 };
 
-function collectBody(req,cb){var d='';req.on('data',function(c){d+=c;if(d.length>5e5)req.destroy()});req.on('end',function(){cb(d)});}
+function sendPoll(res, room, pid) {
+  var myIdx = -1;
+  for (var i=0;i<room.players.length;i++) if (room.players[i].pid===pid) myIdx=i;
+  var r = {ok:true, v:room.v, state:room.state, players:stripPids(room.players),
+           myIdx:myIdx, curQ:room.curQ};
+  if (room.state === 'playing') {
+    var qd = room.questions[room.curQ];
+    r.question = {cat:qd.cat, q:qd.q, a:qd.a, idx:room.curQ};
+    r.qStartTime = room.qStartTime;
+    r.serverTime = Date.now();
+    r.myAnswered = !!room.answers[pid];
+    r.answeredCount = Object.keys(room.answers).length;
+    r.totalPlayers = room.players.length;
+  }
+  if (room.state === 'round-result') {
+    r.correctIdx = room.lastCorrectIdx;
+    r.correctText = room.lastCorrectText;
+    r.roundPlayers = stripPids(room.players);
+    r.curQ = room.curQ;
+  }
+  if (room.state === 'final') r.finalPlayers = stripPids(room.players);
+  res.json(r);
+}
 
 function resolveRound(room) {
   var q = room.questions[room.curQ];

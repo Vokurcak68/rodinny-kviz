@@ -1,7 +1,11 @@
-// Quiz API v6 — GitHub Gist as shared storage (cross-instance safe)
+// Quiz API v6.1 — Gist with /tmp+global fallback
 var https = require('https');
+var fs = require('fs');
 var GIST_ID = process.env.GIST_ID || 'eb389578a90ecde0773e247dca251a32';
 var GH_TOKEN = process.env.GH_TOKEN || '';
+var USE_GIST = !!GH_TOKEN;
+var TMP = '/tmp/qr_';
+if (!global._qr) global._qr = {};
 
 // In-memory cache with short TTL to reduce Gist reads
 var cache = {};
@@ -33,6 +37,13 @@ function gistReq(method, body, cb) {
 }
 
 function readRoom(code, cb) {
+  if (!USE_GIST) {
+    // Fallback: /tmp + global
+    var room = global._qr[code] || null;
+    if (!room) { try { room = JSON.parse(fs.readFileSync(TMP + code, 'utf8')); global._qr[code] = room; } catch(e) {} }
+    cb(null, room);
+    return;
+  }
   var c = cache[code];
   if (c && (Date.now() - c.t) < CACHE_TTL) { cb(null, c.room); return; }
   gistReq('GET', null, function(err, gist) {
@@ -48,6 +59,13 @@ function readRoom(code, cb) {
 }
 
 function writeRoom(code, room, cb) {
+  if (!USE_GIST) {
+    // Fallback: /tmp + global
+    global._qr[code] = room;
+    try { fs.writeFileSync(TMP + code, JSON.stringify(room)); } catch(e) {}
+    if (cb) cb(null);
+    return;
+  }
   cache[code] = {room: room, t: Date.now()};
   var fname = 'room_' + code + '.json';
   var files = {};
@@ -63,8 +81,6 @@ module.exports = function(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Cache-Control', 'no-store');
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
-
-  if (!GH_TOKEN) { res.json({ok:false,error:'no_token'}); return; }
 
   var q = req.query || {};
   var action = q.action || '';

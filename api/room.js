@@ -10,7 +10,7 @@ if (!global._qr) global._qr = {};
 
 // In-memory cache with short TTL to reduce Gist reads
 var cache = {};
-var CACHE_TTL = 800; // ms
+var CACHE_TTL = 2500; // ms — poll uses cache, mutations read fresh
 
 function gistReq(method, body, cb) {
   var opts = {
@@ -37,24 +37,27 @@ function gistReq(method, body, cb) {
   req.end();
 }
 
-function readRoom(code, cb) {
+function readRoom(code, cb, skipCache) {
   if (!USE_GIST) {
-    // Fallback: /tmp + global
     var room = global._qr[code] || null;
     if (!room) { try { room = JSON.parse(fs.readFileSync(TMP + code, 'utf8')); global._qr[code] = room; } catch(e) {} }
     cb(null, room);
     return;
   }
   var c = cache[code];
-  if (c && (Date.now() - c.t) < CACHE_TTL) { cb(null, c.room); return; }
+  if (!skipCache && c && (Date.now() - c.t) < CACHE_TTL) { cb(null, JSON.parse(JSON.stringify(c.room))); return; }
   gistReq('GET', null, function(err, gist) {
-    if (err || !gist || !gist.files) { cb(err || new Error('no gist')); return; }
+    if (err || !gist || !gist.files) {
+      // On error, try cache as fallback
+      if (c) { cb(null, JSON.parse(JSON.stringify(c.room))); return; }
+      cb(err || new Error('no gist')); return;
+    }
     var fname = 'room_' + code + '.json';
     if (!gist.files[fname]) { cb(null, null); return; }
     try {
       var room = JSON.parse(gist.files[fname].content);
       cache[code] = {room: room, t: Date.now()};
-      cb(null, room);
+      cb(null, JSON.parse(JSON.stringify(room)));
     } catch(e) { cb(e); }
   });
 }
@@ -75,6 +78,8 @@ function writeRoom(code, room, cb) {
     if (cb) cb(err);
   });
 }
+
+function readFresh(code, cb) { readFresh(code, cb, true); }
 
 module.exports = function(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -110,7 +115,7 @@ module.exports = function(req, res) {
     var code = (q.code||'').toUpperCase();
     var name = decodeURIComponent(q.name||'Hráč');
     var jr = q.junior === '1';
-    readRoom(code, function(err, room) {
+    readFresh(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
       if (room.state !== 'lobby') { res.json({ok:false,error:'already_started'}); return; }
       if (room.players.length >= 4) { res.json({ok:false,error:'full'}); return; }
@@ -162,7 +167,7 @@ module.exports = function(req, res) {
     var pid = q.pid||'';
     var aidx = parseInt(q.idx);
     var atime = parseFloat(q.time)||15;
-    readRoom(code, function(err, room) {
+    readFresh(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
       if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
       if (room.answers[pid]) { res.json({ok:true,answeredCount:Object.keys(room.answers).length}); return; }
@@ -182,7 +187,7 @@ module.exports = function(req, res) {
   if (action === 'start') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    readRoom(code, function(err, room) {
+    readFresh(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
       if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
       if (room.players.length < 2) { res.json({ok:false,error:'need_more'}); return; }
@@ -199,7 +204,7 @@ module.exports = function(req, res) {
   if (action === 'timeout') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    readRoom(code, function(err, room) {
+    readFresh(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
       if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
       if (room.state !== 'playing') { res.json({ok:true}); return; }
@@ -219,7 +224,7 @@ module.exports = function(req, res) {
   if (action === 'next') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    readRoom(code, function(err, room) {
+    readFresh(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
       if (room.hostPid !== pid) { res.json({ok:false,error:'not_host'}); return; }
       if (room.state !== 'round-result') { res.json({ok:true,state:room.state}); return; }
@@ -238,7 +243,7 @@ module.exports = function(req, res) {
   if (action === 'hint5050') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
-    readRoom(code, function(err, room) {
+    readFresh(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
       if (room.state !== 'playing') { res.json({ok:false,error:'not_playing'}); return; }
       var pl = null;

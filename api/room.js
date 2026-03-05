@@ -79,7 +79,7 @@ function writeRoom(code, room, cb) {
   });
 }
 
-function readFresh(code, cb) { readFresh(code, cb, true); }
+function readFresh(code, cb) { readRoom(code, cb, true); }
 
 module.exports = function(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');

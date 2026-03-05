@@ -131,10 +131,11 @@ module.exports = function(req, res) {
     return;
   }
 
-  /* POLL */
+  /* POLL — always fresh when carrying an answer, cached otherwise */
   if (action === 'poll') {
     var code = (q.code||'').toUpperCase();
     var pid = q.pid||'';
+    var hasAns = !!q.myAns;
     readRoom(code, function(err, room) {
       if (err || !room) { res.json({ok:false,error:'not_found'}); return; }
 
@@ -145,19 +146,22 @@ module.exports = function(req, res) {
         if (parts.length === 3 && parseInt(parts[0]) === room.curQ) {
           room.answers[pid] = {idx:parseInt(parts[1]), time:parseFloat(parts[2])};
           changed = true;
-          if (Object.keys(room.answers).length >= room.players.length) {
-            resolveRound(room);
-          }
-          room.v++; room.lastUpdate = Date.now();
         }
       }
 
+      // Check if all answered → resolve
+      if (room.state === 'playing' && Object.keys(room.answers).length >= room.players.length) {
+        resolveRound(room);
+        changed = true;
+      }
+
       if (changed) {
+        room.v++; room.lastUpdate = Date.now();
         writeRoom(code, room, function() { sendPoll(res, room, pid); });
       } else {
         sendPoll(res, room, pid);
       }
-    });
+    }, hasAns); // skipCache when carrying answer
     return;
   }
 
